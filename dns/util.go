@@ -133,7 +133,7 @@ func transform(servers []NameServer, resolver *Resolver) []dnsClient {
 		case "quic":
 			c = newDoQ(s.Addr, resolver, s.Params, s.ProxyAdapter, s.ProxyName)
 		case "udpme":
-			c = newUdpmeClient(s.Addr)
+			c = newUdpmeClient(s.Addr, resolver, s.Params, s.ProxyAdapter, s.ProxyName)
 		default:
 			c = newClient(s.Addr, resolver, s.Net, s.Params, s.ProxyAdapter, s.ProxyName)
 		}

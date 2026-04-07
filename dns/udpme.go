@@ -2,102 +2,91 @@ package dns
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"time"
 
+	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 	D "github.com/miekg/dns"
 )
 
 type udpmeClient struct {
-	addr     string
-	upstream *udpmeUpstream
+	port   string
+	host   string
+	dialer *dnsDialer
 }
 
 var _ dnsClient = (*udpmeClient)(nil)
 
 func (c *udpmeClient) Address() string {
-	return c.addr
+	return fmt.Sprintf("%s://%s", "udpme", net.JoinHostPort(c.host, c.port))
 }
 
 func (c *udpmeClient) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error) {
-	ch := make(chan struct {
-		msg *D.Msg
-		err error
-	}, 1)
-	go func() {
-		resp, err := c.upstream.Exchange(m)
-		ch <- struct {
-			msg *D.Msg
-			err error
-		}{resp, err}
-	}()
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case r := <-ch:
-		return r.msg, r.err
+	network := "udp"
+	addr := net.JoinHostPort(c.host, c.port)
+	query := m
+	addedEDNS := false
+	if m.IsEdns0() == nil {
+		mc := m.Copy()
+		mc.SetEdns0(4096, false)
+		query = mc
+		addedEDNS = true
+	}
+
+	conn, err := c.dialer.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	udpConn := &D.Conn{Conn: conn, UDPSize: 4096}
+	_ = udpConn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := udpConn.WriteMsg(query); err != nil {
+		return nil, err
+	}
+	for {
+		r, err := udpConn.ReadMsg()
+		if err != nil {
+			return nil, err
+		}
+		if r.Truncated {
+			log.Debugln("[DNS] Truncated reply from %s:%s for %s over UDP, retrying over TCP", c.host, c.port, m.Question[0].String())
+			tcpConn, err := c.dialer.DialContext(ctx, "tcp", addr)
+			if err != nil {
+				return nil, err
+			}
+			defer tcpConn.Close()
+			dClient := &D.Client{Timeout: 5 * time.Second}
+			dConn := &D.Conn{Conn: tcpConn}
+			msg, _, err := dClient.ExchangeWithConn(query, dConn)
+			if err != nil {
+				return nil, err
+			}
+			if addedEDNS {
+				removeEDNS0(msg)
+			}
+			return msg, nil
+		}
+		if r.IsEdns0() == nil {
+			continue
+		}
+		if addedEDNS {
+			removeEDNS0(r)
+		}
+		return r, nil
 	}
 }
 
 func (c *udpmeClient) ResetConnection() {}
 
-func newUdpmeClient(addr string) *udpmeClient {
+func newUdpmeClient(addr string, resolver *Resolver, params map[string]string, proxyAdapter C.ProxyAdapter, proxyName string) *udpmeClient {
+	host, port, _ := net.SplitHostPort(addr)
 	return &udpmeClient{
-		addr:     "udpme://" + addr,
-		upstream: newUpstream(addr),
-	}
-}
-
-type udpmeUpstream struct {
-	Addr string
-}
-
-func tryAddPort(addr string, port string) string {
-	if _, _, err := net.SplitHostPort(addr); err != nil {
-		addr = net.JoinHostPort(addr, port)
-	}
-	return addr
-}
-
-func newUpstream(addr string) *udpmeUpstream {
-	return &udpmeUpstream{Addr: tryAddPort(addr, "53")}
-}
-
-func (u *udpmeUpstream) Exchange(m *D.Msg) (*D.Msg, error) {
-	if m.IsEdns0() != nil {
-		return u.exchangeOPTM(m)
-	}
-	mc := m.Copy()
-	mc.SetEdns0(512, false)
-	r, err := u.exchangeOPTM(mc)
-	if err != nil {
-		return nil, err
-	}
-	removeEDNS0(r)
-	return r, nil
-}
-func (u *udpmeUpstream) exchangeOPTM(m *D.Msg) (*D.Msg, error) {
-	c, err := D.Dial("udp", u.Addr)
-	if err != nil {
-		return nil, err
-	}
-	defer c.Close()
-	c.SetDeadline(time.Now().Add(time.Second * 3))
-	if opt := m.IsEdns0(); opt != nil {
-		c.UDPSize = opt.UDPSize()
-	}
-	if err := c.WriteMsg(m); err != nil {
-		return nil, err
-	}
-	for {
-		r, err := c.ReadMsg()
-		if err != nil {
-			return nil, err
-		}
-		if r.IsEdns0() == nil {
-			continue
-		}
-		return r, nil
+		port:   port,
+		host:   host,
+		dialer: newDNSDialer(resolver, proxyAdapter, proxyName),
 	}
 }
 
@@ -108,5 +97,4 @@ func removeEDNS0(m *D.Msg) {
 			return
 		}
 	}
-	return
 }
