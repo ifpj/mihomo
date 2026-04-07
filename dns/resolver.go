@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"errors"
+	"io"
 	"net/netip"
 	"time"
 
@@ -48,6 +49,10 @@ type Resolver struct {
 	cache                 dnsCache
 	policy                []dnsPolicy
 	defaultResolver       *Resolver
+	// allClients holds every unique dnsClient created for this resolver (including
+	// those inside policies). Used to close io.Closer clients (e.g. autoDHCPClient)
+	// that are otherwise not reachable from main/fallback.
+	allClients []dnsClient
 }
 
 func (r *Resolver) LookupIPPrimaryIPv4(ctx context.Context, host string) (ips []netip.Addr, err error) {
@@ -410,6 +415,30 @@ func (r *Resolver) ResetConnection() {
 	}
 }
 
+// closeClients closes all dnsClient instances that implement io.Closer (e.g. dhcpClient).
+func closeClients(clients []dnsClient) {
+	for _, c := range clients {
+		if closer, ok := c.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
+}
+
+// Close releases resources held by clients (e.g. unregisters interface callbacks).
+func (r *Resolver) Close() {
+	if r != nil {
+		if len(r.allClients) > 0 {
+			closeClients(r.allClients)
+		} else {
+			closeClients(r.main)
+			closeClients(r.fallback)
+		}
+		if dr := r.defaultResolver; dr != nil {
+			dr.Close()
+		}
+	}
+}
+
 type NameServer struct {
 	Net          string
 	Addr         string
@@ -523,6 +552,12 @@ func NewResolverFromClient(client dnsClient) *Resolver {
 	}
 }
 
+func (rs Resolvers) Close() {
+	rs.Resolver.Close()
+	rs.ProxyResolver.Close()
+	rs.DirectResolver.Close()
+}
+
 func NewResolver(config Config) (rs Resolvers) {
 	defaultResolver := &Resolver{
 		main:        transform(config.Default, nil),
@@ -630,6 +665,14 @@ func NewResolver(config Config) (rs Resolvers) {
 		r.fallbackDomainFilters = config.FallbackDomainFilter
 		r.fallbackLazyQuery = config.FallbackLazyQuery
 	}
+
+	// Collect all unique dnsClients so Close() can release them regardless of
+	// whether they are in main, fallback, or buried inside policy tries.
+	allClients := make([]dnsClient, 0, len(nameServerCache))
+	for _, nsc := range nameServerCache {
+		allClients = append(allClients, nsc.dnsClient)
+	}
+	r.allClients = allClients
 
 	return
 }
