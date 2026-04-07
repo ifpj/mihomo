@@ -1256,6 +1256,10 @@ func parseNameServer(servers []string, respectRules bool, preferH3 bool) ([]dns.
 				dnsNetType = "system"
 				addr = ""
 			}
+			if addr == "auto" { // "dhcp://auto" means auto-detect default interface
+				dnsNetType = "dhcp-auto"
+				addr = ""
+			}
 		case "rcode":
 			dnsNetType = "rcode"
 			addr = u.Host
