@@ -241,11 +241,12 @@ func printQueryHeader(query, kind, original string) {
 }
 
 // printCategoryLine prints one matched category with its rules on the same line.
-//   GEOSITE,CN  →  domain:google.com  keyword:google
-func printCategoryLine(ruleType, code string, rules []string) {
-	line := fmt.Sprintf("  %s%s,%s%s%s%s",
+//   GEOSITE,CN (5823)  →  domain:google.com  keyword:google
+func printCategoryLine(ruleType, code string, total int, rules []string) {
+	line := fmt.Sprintf("  %s%s,%s%s%s%s %s(%d)%s",
 		ansi(dim), ruleType, r(),
 		ansi(bold, cyan), code, r(),
+		ansi(dim), total, r(),
 	)
 	if len(rules) > 0 {
 		sep := fmt.Sprintf("  %s→%s  ", ansi(dim), r())
@@ -284,6 +285,7 @@ func lookupDomain(domain, original string) {
 
 	type result struct {
 		code  string
+		total int
 		rules []string
 	}
 	var matched []result
@@ -303,6 +305,7 @@ func lookupDomain(domain, original string) {
 		// then retrieves the individual matching rules for display.
 		type group struct {
 			attrSuffix string
+			total      int
 			rules      []string
 		}
 		allRules := make([]string, 0, len(entries))
@@ -321,10 +324,20 @@ func lookupDomain(domain, original string) {
 			}
 			groups[sig].rules = append(groups[sig].rules, rule)
 		}
-		matched = append(matched, result{code, allRules})
+		// count total rules per attr group across the whole entry
+		for _, d := range entry.Domain {
+			if len(d.Attribute) == 0 {
+				continue
+			}
+			sig := attrSig(d.Attribute)
+			if g, ok := groups[sig]; ok {
+				g.total++
+			}
+		}
+		matched = append(matched, result{code, len(entry.Domain), allRules})
 		for _, sig := range order {
 			g := groups[sig]
-			matched = append(matched, result{code + g.attrSuffix, g.rules})
+			matched = append(matched, result{code + g.attrSuffix, g.total, g.rules})
 		}
 	}
 
@@ -335,7 +348,7 @@ func lookupDomain(domain, original string) {
 	}
 	printSectionHeader("GeoSite", len(matched))
 	for _, r := range matched {
-		printCategoryLine("GEOSITE", r.code, r.rules)
+		printCategoryLine("GEOSITE", r.code, r.total, r.rules)
 	}
 }
 
@@ -354,20 +367,21 @@ func lookupIP(ip netip.Addr, original string) {
 
 	type result struct {
 		code  string
+		total int
 		cidrs []string
 	}
 	var matched []result
 
 	if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
 		ip.IsMulticast() || ip.IsUnspecified() {
-		matched = append(matched, result{"lan", nil})
+		matched = append(matched, result{"lan", 0, nil})
 	}
 
 	for _, entry := range list.Entry {
 		code := strings.ToLower(entry.CountryCode)
 		cidrs := matchedCIDRs(ip, entry.Cidr)
 		if len(cidrs) > 0 {
-			matched = append(matched, result{code, cidrs})
+			matched = append(matched, result{code, len(entry.Cidr), cidrs})
 		}
 	}
 
@@ -378,6 +392,6 @@ func lookupIP(ip netip.Addr, original string) {
 	}
 	printSectionHeader("GeoIP", len(matched))
 	for _, r := range matched {
-		printCategoryLine("GEOIP", r.code, r.cidrs)
+		printCategoryLine("GEOIP", r.code, r.total, r.cidrs)
 	}
 }
