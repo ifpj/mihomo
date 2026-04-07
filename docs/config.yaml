@@ -1894,6 +1894,14 @@ proxy-providers:
       enable: true
       interval: 36000
       url: https://cp.cloudflare.com/generate_204
+# geo-ruleset 用于显式导入 geosite/geoip 的 mrs ruleset，并展开为普通 rule-provider
+geo-ruleset:
+  geosite:
+    - cn
+    - google
+  geoip:
+    - telegram
+
 # rule-provider-templates 用于批量生成 rule-providers
 # 通过模板可以避免重复配置，只需定义一次模板，然后通过 expand 字段展开成多个 rule-provider
 rule-provider-templates:
