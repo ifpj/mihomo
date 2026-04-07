@@ -8,7 +8,7 @@ VERSION=beta-$(shell git rev-parse --short HEAD)
 else ifeq ($(BRANCH),)
 VERSION=$(shell git describe --tags)
 else
-VERSION=$(shell git rev-parse --short HEAD)
+VERSION=$(shell git describe --tags)
 endif
 
 BUILDTIME=$(shell date -u)
@@ -138,7 +138,7 @@ linux-mips64le:
 
 linux-riscv64:
 	GOARCH=riscv64 GOOS=linux $(GOBUILD) -o $(BINDIR)/$(NAME)-$@
-	
+
 linux-loong64:
 	GOARCH=loong64 GOOS=linux $(GOBUILD) -o $(BINDIR)/$(NAME)-$@
 
