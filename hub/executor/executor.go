@@ -235,7 +235,70 @@ func updateNTP(c *config.NTP) {
 	}
 }
 
+func hasAutoDetectDHCP(c *config.DNS) bool {
+	isAuto := func(ns dns.NameServer) bool {
+		return ns.Net == "dhcp-auto"
+	}
+	for _, ns := range c.NameServer {
+		if isAuto(ns) {
+			return true
+		}
+	}
+	for _, ns := range c.Fallback {
+		if isAuto(ns) {
+			return true
+		}
+	}
+	for _, ns := range c.DefaultNameserver {
+		if isAuto(ns) {
+			return true
+		}
+	}
+	for _, ns := range c.ProxyServerNameserver {
+		if isAuto(ns) {
+			return true
+		}
+	}
+	for _, ns := range c.DirectNameServer {
+		if isAuto(ns) {
+			return true
+		}
+	}
+	for _, policy := range c.NameServerPolicy {
+		for _, ns := range policy.NameServers {
+			if isAuto(ns) {
+				return true
+			}
+		}
+	}
+	for _, policy := range c.ProxyServerPolicy {
+		for _, ns := range policy.NameServers {
+			if isAuto(ns) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func updateDNS(c *config.DNS, generalIPv6 bool) {
+	// Start global interface monitor if any nameserver uses dhcp://auto,
+	// stop it otherwise. Must happen before NewResolver so eager DHCP fetch works.
+	if hasAutoDetectDHCP(c) {
+		if err := iface.StartDefaultInterfaceMonitor(log.SingLogger, func() {
+			resolver.ResetConnection()
+		}); err != nil {
+			log.Warnln("Failed to start default interface monitor: %v", err)
+		}
+	} else {
+		iface.StopDefaultInterfaceMonitor()
+	}
+
+	// close old resolver to release resources (e.g. DHCP interface change callbacks)
+	if old, ok := resolver.DefaultResolver.(dns.Resolvers); ok {
+		old.Close()
+	}
+
 	if !c.Enable {
 		resolver.DefaultResolver = nil
 		resolver.DefaultHostMapper = nil
@@ -533,6 +596,7 @@ func Shutdown() {
 	listener.Cleanup()
 	tproxy.CleanupTProxyIPTables()
 	resolver.StoreFakePoolState()
+	iface.StopDefaultInterfaceMonitor()
 
 	log.Warnln("Mihomo shutting down")
 }
