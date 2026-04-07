@@ -109,15 +109,6 @@ func main() {
 			fmt.Printf("Use tags: %s\n", strings.Join(tags, ", "))
 		}
 
-		if C.Custom != "" {
-			fmt.Printf("\n")
-			for _, line := range strings.Split(C.Custom, "<ENTER>") {
-				line = strings.TrimSpace(line)
-				if line != "" {
-					fmt.Println(line)
-				}
-			}
-		}
 		return
 	}
 
