@@ -2,6 +2,7 @@ package dns
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/netip"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/metacubex/mihomo/component/dhcp"
 	"github.com/metacubex/mihomo/component/iface"
+	"github.com/metacubex/mihomo/log"
 	D "github.com/miekg/dns"
 )
 
@@ -153,4 +155,143 @@ func (d *dhcpClient) invalidate() (bool, error) {
 
 func newDHCPClient(ifaceName string) *dhcpClient {
 	return &dhcpClient{ifaceName: ifaceName}
+}
+
+// --- dhcp://auto: auto-detect default interface ---
+
+const DHCPTimeoutAuto = 5 * time.Second
+
+type autoDHCPClient struct {
+	lock         sync.RWMutex
+	updatedAt    time.Time
+	lastError    error
+	clients      []dnsClient
+	currentIface string
+	unregister   func()
+}
+
+var (
+	_ dnsClient = (*autoDHCPClient)(nil)
+	_ io.Closer = (*autoDHCPClient)(nil)
+)
+
+func (d *autoDHCPClient) Address() string {
+	if name, err := iface.GetDefaultInterfaceName(); err == nil {
+		return "dhcp://auto(" + name + ")"
+	}
+	return "dhcp://auto"
+}
+
+func (d *autoDHCPClient) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
+	clients, err := d.fetch()
+	if err != nil {
+		return nil, err
+	}
+	msg, _, err = batchExchange(ctx, clients, m)
+	return
+}
+
+func (d *autoDHCPClient) ResetConnection() {
+	d.lock.Lock()
+	for _, client := range d.clients {
+		client.ResetConnection()
+	}
+	d.updatedAt = time.Time{}
+	d.lock.Unlock()
+}
+
+func (d *autoDHCPClient) Close() error {
+	if d.unregister != nil {
+		d.unregister()
+		d.unregister = nil
+	}
+	return nil
+}
+
+func (d *autoDHCPClient) interfaceUpdated() {
+	go func() {
+		d.lock.Lock()
+		defer d.lock.Unlock()
+		d.updatedAt = time.Time{}
+		d.lastError = nil
+		if err := d.updateServers(); err != nil {
+			log.Warnln("[DHCP] update servers on interface change: %v", err)
+		}
+	}()
+}
+
+func (d *autoDHCPClient) fetch() ([]dnsClient, error) {
+	d.lock.RLock()
+	updatedAt, lastError, clients := d.updatedAt, d.lastError, d.clients
+	d.lock.RUnlock()
+
+	if lastError != nil {
+		return nil, lastError
+	}
+	if time.Since(updatedAt) < DHCPTTL {
+		return clients, nil
+	}
+
+	d.lock.Lock()
+	defer d.lock.Unlock()
+
+	if d.lastError != nil {
+		return nil, d.lastError
+	}
+	if time.Since(d.updatedAt) < DHCPTTL {
+		return d.clients, nil
+	}
+
+	if err := d.updateServers(); err != nil {
+		return clients, err
+	}
+	return d.clients, nil
+}
+
+func (d *autoDHCPClient) updateServers() error {
+	name, err := iface.GetDefaultInterfaceName()
+	if err != nil {
+		d.updatedAt = time.Now()
+		d.lastError = err
+		return err
+	}
+	d.currentIface = name
+
+	ctx, cancel := context.WithTimeout(context.Background(), DHCPTimeoutAuto)
+	defer cancel()
+
+	dnsAddrs, err := dhcp.ResolveDNSFromDHCP(ctx, name)
+	d.updatedAt = time.Now()
+	if err != nil {
+		d.lastError = err
+		return err
+	}
+	if len(dnsAddrs) == 0 {
+		d.lastError = dhcp.ErrNotFound
+		return d.lastError
+	}
+
+	nameserver := make([]NameServer, 0, len(dnsAddrs))
+	for _, item := range dnsAddrs {
+		nameserver = append(nameserver, NameServer{
+			Addr:      net.JoinHostPort(item.String(), "53"),
+			ProxyName: name,
+		})
+	}
+	d.clients = transform(nameserver, nil)
+	d.lastError = nil
+	return nil
+}
+
+func newAutoDHCPClient() *autoDHCPClient {
+	c := &autoDHCPClient{}
+	c.unregister = iface.RegisterDefaultInterfaceChanged(c.interfaceUpdated)
+	go func() {
+		c.lock.Lock()
+		defer c.lock.Unlock()
+		if err := c.updateServers(); err != nil {
+			log.Warnln("[DHCP] initial fetch: %v", err)
+		}
+	}()
+	return c
 }
