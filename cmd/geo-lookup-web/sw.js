@@ -1,5 +1,5 @@
-const CACHE = 'geo-lookup-v1';
-const LARGE = ['GeoSite.dat', 'GeoIP.dat', 'main.wasm'];
+const CACHE = 'geo-lookup-v3';
+const LARGE = ['GeoSite.dat.bin', 'GeoIP.dat.bin', 'main.wasm.bin'];
 
 self.addEventListener('install', e => {
   self.skipWaiting();

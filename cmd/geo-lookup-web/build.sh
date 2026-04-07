@@ -11,7 +11,8 @@ mkdir -p "$DIST"
 
 # ── 1. Build WASM ─────────────────────────────────────────────────────────────
 echo "==> Building WASM..."
-GOOS=js GOARCH=wasm go build -o "$DIST/main.wasm" "$SCRIPT_DIR"
+GOOS=js GOARCH=wasm go build -ldflags="-s -w" -o "$DIST/main.wasm" "$SCRIPT_DIR"
+gzip -9 -c "$DIST/main.wasm" > "$DIST/main.wasm.bin" && rm "$DIST/main.wasm"
 
 # ── 2. Copy wasm_exec.js ──────────────────────────────────────────────────────
 echo "==> Copying wasm_exec.js..."
@@ -24,12 +25,12 @@ echo "==> Copying static files..."
 cp "$SCRIPT_DIR/index.html" "$DIST/index.html"
 cp "$SCRIPT_DIR/sw.js"      "$DIST/sw.js"
 
-# ── 4. Download .dat files ────────────────────────────────────────────────────
+# ── 4. Download and gzip .dat files ──────────────────────────────────────────
 echo "==> Downloading GeoSite.dat..."
-curl -fL --progress-bar -o "$DIST/GeoSite.dat" "$GEOSITE_URL"
+curl -fL --progress-bar "$GEOSITE_URL" | gzip -9 > "$DIST/GeoSite.dat.bin"
 
 echo "==> Downloading GeoIP.dat..."
-curl -fL --progress-bar -o "$DIST/GeoIP.dat" "$GEOIP_URL"
+curl -fL --progress-bar "$GEOIP_URL" | gzip -9 > "$DIST/GeoIP.dat.bin"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
