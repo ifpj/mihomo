@@ -436,9 +436,10 @@ type RawConfig struct {
 	KeepAliveInterval       int                     `yaml:"keep-alive-interval" json:"keep-alive-interval"`
 	DisableKeepAlive        bool                    `yaml:"disable-keep-alive" json:"disable-keep-alive"`
 
-	ProxyProvider map[string]map[string]any `yaml:"proxy-providers" json:"proxy-providers"`
-	RuleProvider  map[string]map[string]any `yaml:"rule-providers" json:"rule-providers"`
-	Proxy         []map[string]any          `yaml:"proxies" json:"proxies"`
+	ProxyProvider         map[string]map[string]any `yaml:"proxy-providers" json:"proxy-providers"`
+	RuleProvider          map[string]map[string]any `yaml:"rule-providers" json:"rule-providers"`
+	RuleProviderTemplates []map[string]any          `yaml:"rule-provider-templates" json:"rule-provider-templates"`
+	Proxy                 []map[string]any          `yaml:"proxies" json:"proxies"`
 	ProxyGroup    []map[string]any          `yaml:"proxy-groups" json:"proxy-groups"`
 	Rule          []string                  `yaml:"rules" json:"rule"`
 	SubRules      map[string][]string       `yaml:"sub-rules" json:"sub-rules"`
@@ -988,9 +989,74 @@ func parseListeners(cfg *RawConfig) (listeners map[string]C.InboundListener, err
 	return
 }
 
+func expandRuleProviderTemplates(cfg *RawConfig) error {
+	if len(cfg.RuleProviderTemplates) == 0 {
+		return nil
+	}
+
+	if cfg.RuleProvider == nil {
+		cfg.RuleProvider = make(map[string]map[string]any)
+	}
+
+	for i, template := range cfg.RuleProviderTemplates {
+		expandRaw, ok := template["expand"]
+		if !ok {
+			return fmt.Errorf("rule-provider-templates[%d] missing 'expand' field", i)
+		}
+
+		expandList, ok := expandRaw.([]any)
+		if !ok {
+			return fmt.Errorf("rule-provider-templates[%d] 'expand' field must be a list", i)
+		}
+
+		for _, item := range expandList {
+			itemMap, ok := item.(map[string]any)
+			if !ok {
+				return fmt.Errorf("rule-provider-templates[%d] expand item must be a map", i)
+			}
+
+			providerName, ok := itemMap["name"].(string)
+			if !ok || providerName == "" {
+				return fmt.Errorf("rule-provider-templates[%d] expand item missing 'name' field", i)
+			}
+
+			if _, exists := cfg.RuleProvider[providerName]; exists {
+				return fmt.Errorf("rule-provider %s already exists (from rule-provider-templates[%d])", providerName, i)
+			}
+
+			newProvider := make(map[string]any)
+			for k, v := range template {
+				if k == "expand" {
+					continue
+				}
+				if str, ok := v.(string); ok {
+					for varName, varValue := range itemMap {
+						if varValueStr, ok := varValue.(string); ok {
+							str = strings.ReplaceAll(str, fmt.Sprintf("{%s}", varName), varValueStr)
+						}
+					}
+					newProvider[k] = str
+				} else {
+					newProvider[k] = v
+				}
+			}
+
+			cfg.RuleProvider[providerName] = newProvider
+		}
+	}
+
+	return nil
+}
+
 func parseRuleProviders(cfg *RawConfig) (ruleProviders map[string]P.RuleProvider, err error) {
 	RP.SetTunnel(T.Tunnel)
 	ruleProviders = map[string]P.RuleProvider{}
+
+	// 展开模板
+	if err := expandRuleProviderTemplates(cfg); err != nil {
+		return nil, err
+	}
+
 	// parse rule provider
 	for name, mapping := range cfg.RuleProvider {
 		rp, err := RP.ParseRuleProvider(name, mapping, R.ParseRule)
