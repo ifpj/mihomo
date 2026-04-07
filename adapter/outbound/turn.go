@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
@@ -32,18 +33,21 @@ const (
 	stunConnOK      uint16 = 0x010A
 	stunBindReq     uint16 = 0x000B
 	stunBindOK      uint16 = 0x010B
+	stunSendInd     uint16 = 0x0016
+	stunDataInd     uint16 = 0x0017
 )
 
 // STUN attribute types
 const (
 	stunAttrUsername uint16 = 0x0006
-	stunAttrMsgIntg uint16 = 0x0008
-	stunAttrErrCode uint16 = 0x0009
-	stunAttrXorPeer uint16 = 0x0012
-	stunAttrRealm   uint16 = 0x0014
-	stunAttrNonce   uint16 = 0x0015
-	stunAttrReqTran uint16 = 0x0019
-	stunAttrConnID  uint16 = 0x002A
+	stunAttrMsgIntg  uint16 = 0x0008
+	stunAttrErrCode  uint16 = 0x0009
+	stunAttrXorPeer  uint16 = 0x0012
+	stunAttrData     uint16 = 0x0013
+	stunAttrRealm    uint16 = 0x0014
+	stunAttrNonce    uint16 = 0x0015
+	stunAttrReqTran  uint16 = 0x0019
+	stunAttrConnID   uint16 = 0x002A
 )
 
 type Turn struct {
@@ -103,6 +107,197 @@ func (t *Turn) ProxyInfo() C.ProxyInfo {
 	return info
 }
 
+// ListenPacketContext implements C.ProxyAdapter using TURN UDP allocation (RFC 5766).
+func (t *Turn) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
+	c, err := t.dialer.DialContext(ctx, "tcp", t.addr)
+	if err != nil {
+		return nil, fmt.Errorf("%s connect error: %w", t.addr, err)
+	}
+
+	pc, err := t.turnAllocateUDP(ctx, c)
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+
+	return newPacketConn(pc, t), nil
+}
+
+// turnAllocateUDP performs TURN UDP allocation and returns a net.PacketConn.
+func (t *Turn) turnAllocateUDP(ctx context.Context, ctrlConn net.Conn) (net.PacketConn, error) {
+	transportVal := []byte{17, 0, 0, 0} // UDP = protocol number 17
+
+	// Step 1: unauthenticated Allocate
+	if _, err := ctrlConn.Write(stunBuildMsg(stunAllocateReq, stunNewTxnID(),
+		stunBuildAttr(stunAttrReqTran, transportVal),
+	)); err != nil {
+		return nil, fmt.Errorf("turn udp: send allocate: %w", err)
+	}
+
+	msgType, attrs, err := stunReadMsg(ctrlConn)
+	if err != nil {
+		return nil, fmt.Errorf("turn udp: read allocate response: %w", err)
+	}
+
+	var key []byte
+	var authAttrs [][]byte
+
+	switch {
+	case msgType == stunAllocateErr && t.user != "" && stunParseErrCode(attrs[stunAttrErrCode]) == 401:
+		realm := string(attrs[stunAttrRealm])
+		nonce := attrs[stunAttrNonce]
+		h := md5.Sum([]byte(t.user + ":" + realm + ":" + t.pass))
+		key = h[:]
+		authAttrs = [][]byte{
+			stunBuildAttr(stunAttrUsername, []byte(t.user)),
+			stunBuildAttr(stunAttrRealm, []byte(realm)),
+			stunBuildAttr(stunAttrNonce, nonce),
+		}
+		am := stunSign(stunBuildMsg(stunAllocateReq, stunNewTxnID(),
+			append([][]byte{stunBuildAttr(stunAttrReqTran, transportVal)}, authAttrs...)...,
+		), key)
+		if _, err := ctrlConn.Write(am); err != nil {
+			return nil, fmt.Errorf("turn udp: send auth allocate: %w", err)
+		}
+		if msgType, _, err = stunReadMsg(ctrlConn); err != nil {
+			return nil, fmt.Errorf("turn udp: read auth allocate response: %w", err)
+		}
+		if msgType != stunAllocateOK {
+			return nil, fmt.Errorf("turn udp: allocate failed (0x%04x)", msgType)
+		}
+	case msgType == stunAllocateOK:
+		// no auth needed
+	default:
+		return nil, fmt.Errorf("turn udp: unexpected allocate response (0x%04x)", msgType)
+	}
+
+	pc := &turnPacketConn{
+		ctrlConn:  ctrlConn,
+		key:       key,
+		authAttrs: authAttrs,
+		recvCh:    make(chan turnUDPPacket, 64),
+		closed:    make(chan struct{}),
+		perms:     make(map[string]struct{}),
+	}
+	go pc.readLoop()
+	return pc, nil
+}
+
+type turnUDPPacket struct {
+	data []byte
+	addr net.Addr
+}
+
+// turnPacketConn implements net.PacketConn over a TURN UDP allocation.
+// It uses Send Indication (0x0016) to send and receives Data Indication (0x0017).
+type turnPacketConn struct {
+	ctrlConn  net.Conn
+	key       []byte
+	authAttrs [][]byte
+	recvCh    chan turnUDPPacket
+	closed    chan struct{}
+	closeOnce sync.Once
+	permsMu   sync.Mutex
+	perms     map[string]struct{} // permitted IPs
+}
+
+func (p *turnPacketConn) readLoop() {
+	for {
+		msgType, attrs, err := stunReadMsg(p.ctrlConn)
+		if err != nil {
+			p.Close()
+			return
+		}
+		if msgType == stunDataInd {
+			peerVal := attrs[stunAttrXorPeer]
+			data := attrs[stunAttrData]
+			if data == nil {
+				continue
+			}
+			var addr net.Addr
+			if peerVal != nil {
+				ip, port := stunParseXorPeerAddr(peerVal)
+				if ip != nil {
+					addr = &net.UDPAddr{IP: ip, Port: int(port)}
+				}
+			}
+			if addr == nil {
+				addr = p.ctrlConn.RemoteAddr()
+			}
+			buf := make([]byte, len(data))
+			copy(buf, data)
+			select {
+			case p.recvCh <- turnUDPPacket{data: buf, addr: addr}:
+			case <-p.closed:
+				return
+			}
+		}
+	}
+}
+
+func (p *turnPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return 0, fmt.Errorf("turn udp: unsupported addr type")
+	}
+	tid := stunNewTxnID()
+	peerVal := stunXorPeerAddr(udpAddr.IP, uint16(udpAddr.Port), tid)
+	if peerVal == nil {
+		return 0, fmt.Errorf("turn udp: unsupported peer address")
+	}
+
+	// Ensure CreatePermission for this IP (fire-and-forget, like JS ensurePerm)
+	ipKey := udpAddr.IP.String()
+	p.permsMu.Lock()
+	_, hasPerm := p.perms[ipKey]
+	if !hasPerm {
+		p.perms[ipKey] = struct{}{}
+	}
+	p.permsMu.Unlock()
+	if !hasPerm {
+		permTid := stunNewTxnID()
+		permPeer := stunXorPeerAddr(udpAddr.IP, 0, permTid)
+		permAttrs := append([][]byte{stunBuildAttr(stunAttrXorPeer, permPeer)}, p.authAttrs...)
+		permMsg := stunSign(stunBuildMsg(stunPermReq, permTid, permAttrs...), p.key)
+		if _, err := p.ctrlConn.Write(permMsg); err != nil {
+			return 0, fmt.Errorf("turn udp: send permission: %w", err)
+		}
+	}
+
+	attrs := [][]byte{
+		stunBuildAttr(stunAttrXorPeer, peerVal),
+		stunBuildAttr(stunAttrData, b),
+	}
+	msg := stunBuildMsg(stunSendInd, tid, attrs...) // Send Indication: no MESSAGE-INTEGRITY per RFC 5766
+	if _, err := p.ctrlConn.Write(msg); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (p *turnPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	select {
+	case pkt := <-p.recvCh:
+		n := copy(b, pkt.data)
+		return n, pkt.addr, nil
+	case <-p.closed:
+		return 0, nil, net.ErrClosed
+	}
+}
+
+func (p *turnPacketConn) Close() error {
+	p.closeOnce.Do(func() {
+		close(p.closed)
+		p.ctrlConn.Close()
+	})
+	return nil
+}
+
+func (p *turnPacketConn) LocalAddr() net.Addr                { return p.ctrlConn.LocalAddr() }
+func (p *turnPacketConn) SetDeadline(t time.Time) error      { return p.ctrlConn.SetDeadline(t) }
+func (p *turnPacketConn) SetReadDeadline(t time.Time) error  { return p.ctrlConn.SetReadDeadline(t) }
+func (p *turnPacketConn) SetWriteDeadline(t time.Time) error { return p.ctrlConn.SetWriteDeadline(t) }
+
 func NewTurn(option TurnOption) (*Turn, error) {
 	addr := net.JoinHostPort(option.Server, strconv.Itoa(option.Port))
 
@@ -111,6 +306,7 @@ func NewTurn(option TurnOption) (*Turn, error) {
 			name:   option.Name,
 			addr:   addr,
 			tp:     C.Turn,
+			udp:    true,
 			pdName: option.ProviderName,
 			tfo:    option.TFO,
 			mpTcp:  option.MPTCP,
@@ -360,6 +556,29 @@ func stunXorPeerAddr(ip net.IP, port uint16, tid [12]byte) []byte {
 		return b
 	}
 	return nil
+}
+
+// stunParseXorPeerAddr decodes an XOR-PEER-ADDRESS attribute value back to IP and port.
+func stunParseXorPeerAddr(b []byte) (net.IP, uint16) {
+	if len(b) < 8 {
+		return nil, 0
+	}
+	port := binary.BigEndian.Uint16(b[2:]) ^ 0x2112
+	if b[1] == 0x01 && len(b) >= 8 {
+		ip := make(net.IP, 4)
+		for i := 0; i < 4; i++ {
+			ip[i] = b[4+i] ^ stunMagicCookie[i]
+		}
+		return ip, port
+	}
+	if b[1] == 0x02 && len(b) >= 20 {
+		ip := make(net.IP, 16)
+		for i := 0; i < 16; i++ {
+			ip[i] = b[4+i] ^ stunMagicCookie[i%4]
+		}
+		return ip, port
+	}
+	return nil, 0
 }
 
 // stunSign adds MESSAGE-INTEGRITY to a STUN message using HMAC-SHA1.
