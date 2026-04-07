@@ -1645,6 +1645,33 @@ proxy-providers:
       enable: true
       interval: 36000
       url: https://cp.cloudflare.com/generate_204
+# rule-provider-templates 用于批量生成 rule-providers
+# 通过模板可以避免重复配置，只需定义一次模板，然后通过 expand 字段展开成多个 rule-provider
+rule-provider-templates:
+  - type: http
+    behavior: domain
+    format: mrs
+    interval: 86400
+    url: "https://example.com/rules/{name}.mrs"  # {name} 会被替换为 expand 中的 name 值
+    expand:
+      - name: google      # 展开后生成 rule-provider: google，url 为 https://example.com/rules/google.mrs
+      - name: github      # 展开后生成 rule-provider: github，url 为 https://example.com/rules/github.mrs
+      - name: telegram    # 展开后生成 rule-provider: telegram，url 为 https://example.com/rules/telegram.mrs
+
+  # 支持多个变量替换
+  - type: http
+    behavior: ipcidr
+    interval: 3600
+    url: "https://{domain}/rules/{category}/{name}.yaml"
+    path: "./rules/{category}-{name}.yaml"
+    expand:
+      - name: cn
+        domain: example.com
+        category: geoip
+      - name: us
+        domain: example.com
+        category: geoip
+
 rule-providers:
   rule1:
     behavior: classical # domain ipcidr
