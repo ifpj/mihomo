@@ -124,6 +124,8 @@ func transform(servers []NameServer, resolver *Resolver) []dnsClient {
 			c = newDoHClient(s.Addr, resolver, s.PreferH3, s.Params, s.ProxyAdapter, s.ProxyName)
 		case "dhcp":
 			c = newDHCPClient(s.Addr)
+		case "dhcp-auto":
+			c = newAutoDHCPClient()
 		case "system":
 			c = newSystemClient()
 		case "tailscale":
