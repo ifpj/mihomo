@@ -390,6 +390,11 @@ type RawTLS struct {
 	CustomTrustCert []string `yaml:"custom-certifactes" json:"custom-certifactes"`
 }
 
+type RawGeoRuleset struct {
+	GeoSite []string `yaml:"geosite" json:"geosite"`
+	GeoIP   []string `yaml:"geoip" json:"geoip"`
+}
+
 type RawConfig struct {
 	Port                    int                     `yaml:"port" json:"port"`
 	SocksPort               int                     `yaml:"socks-port" json:"socks-port"`
@@ -440,6 +445,7 @@ type RawConfig struct {
 	ProxyProvider         map[string]map[string]any `yaml:"proxy-providers" json:"proxy-providers"`
 	RuleProvider          map[string]map[string]any `yaml:"rule-providers" json:"rule-providers"`
 	RuleProviderTemplates []map[string]any          `yaml:"rule-provider-templates" json:"rule-provider-templates"`
+	GeoRuleset            RawGeoRuleset             `yaml:"geo-ruleset" json:"geo-ruleset"`
 	Proxy                 []map[string]any          `yaml:"proxies" json:"proxies"`
 	ProxyGroup    []map[string]any          `yaml:"proxy-groups" json:"proxy-groups"`
 	Rule          []string                  `yaml:"rules" json:"rule"`
@@ -1000,6 +1006,73 @@ func parseListeners(cfg *RawConfig) (listeners map[string]C.InboundListener, err
 	return
 }
 
+func geoRuleSetProviderName(tp, name string) string {
+	return strings.ToLower(tp) + "-" + strings.ToLower(strings.TrimSpace(name))
+}
+
+func geoRuleSetURL(tp, name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	switch strings.ToLower(tp) {
+	case "geosite":
+		return fmt.Sprintf("https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/refs/heads/meta/geo/geosite/%s.mrs", name)
+	case "geoip":
+		return fmt.Sprintf("https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/refs/heads/meta/geo/geoip/%s.mrs", name)
+	default:
+		return ""
+	}
+}
+
+func expandGeoRuleset(cfg *RawConfig) error {
+	if len(cfg.GeoRuleset.GeoSite) == 0 && len(cfg.GeoRuleset.GeoIP) == 0 {
+		return nil
+	}
+
+	if cfg.RuleProvider == nil {
+		cfg.RuleProvider = make(map[string]map[string]any)
+	}
+
+	for i, name := range cfg.GeoRuleset.GeoSite {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return fmt.Errorf("geo-ruleset.geosite[%d] is empty", i)
+		}
+		providerName := geoRuleSetProviderName("geosite", name)
+		if _, exists := cfg.RuleProvider[providerName]; exists {
+			return fmt.Errorf("rule provider %s already exists (from geo-ruleset.geosite[%d])", providerName, i)
+		}
+		cfg.RuleProvider[providerName] = map[string]any{
+			"type":     "http",
+			"behavior": "domain",
+			"format":   "mrs",
+			"interval": 86400,
+			"url":      geoRuleSetURL("geosite", name),
+		}
+	}
+
+	for i, name := range cfg.GeoRuleset.GeoIP {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return fmt.Errorf("geo-ruleset.geoip[%d] is empty", i)
+		}
+		if strings.EqualFold(name, "lan") {
+			return fmt.Errorf("geo-ruleset.geoip[%d] does not support lan", i)
+		}
+		providerName := geoRuleSetProviderName("geoip", name)
+		if _, exists := cfg.RuleProvider[providerName]; exists {
+			return fmt.Errorf("rule provider %s already exists (from geo-ruleset.geoip[%d])", providerName, i)
+		}
+		cfg.RuleProvider[providerName] = map[string]any{
+			"type":     "http",
+			"behavior": "ipcidr",
+			"format":   "mrs",
+			"interval": 86400,
+			"url":      geoRuleSetURL("geoip", name),
+		}
+	}
+
+	return nil
+}
+
 func expandRuleProviderTemplates(cfg *RawConfig) error {
 	if len(cfg.RuleProviderTemplates) == 0 {
 		return nil
@@ -1062,6 +1135,10 @@ func expandRuleProviderTemplates(cfg *RawConfig) error {
 func parseRuleProviders(cfg *RawConfig) (ruleProviders map[string]P.RuleProvider, err error) {
 	RP.SetTunnel(T.Tunnel)
 	ruleProviders = map[string]P.RuleProvider{}
+
+	if err := expandGeoRuleset(cfg); err != nil {
+		return nil, err
+	}
 
 	// 展开模板
 	if err := expandRuleProviderTemplates(cfg); err != nil {
