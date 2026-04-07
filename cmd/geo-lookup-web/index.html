@@ -201,8 +201,8 @@ let ipReady   = false;
 async function fetchBytes(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const buf = await res.arrayBuffer();
-  return new Uint8Array(buf);
+  const stream = res.body.pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
 function setStatus(id, state, text) {
@@ -219,15 +219,17 @@ function checkReady() {
 }
 
 (async () => {
-  // Load WASM
-  const wasmRes = await WebAssembly.instantiateStreaming(fetch('main.wasm'), go.importObject);
+  // Load WASM (gzip-compressed)
+  const wasmStream = (await fetch('main.wasm.bin')).body.pipeThrough(new DecompressionStream('gzip'));
+  const wasmBytes  = await new Response(wasmStream).arrayBuffer();
+  const wasmRes    = await WebAssembly.instantiate(wasmBytes, go.importObject);
   go.run(wasmRes.instance);   // starts main(), which registers geoInit / geoLookup
   wasmReady = true;
 
   // Load .dat files in parallel
   const [siteData, ipData] = await Promise.all([
-    fetchBytes('GeoSite.dat').catch(e => { setStatus('site','error','GeoSite 加载失败'); throw e; }),
-    fetchBytes('GeoIP.dat').catch(e  => { setStatus('ip',  'error','GeoIP 加载失败');   throw e; }),
+    fetchBytes('GeoSite.dat.bin').catch(e => { setStatus('site','error','GeoSite 加载失败'); throw e; }),
+    fetchBytes('GeoIP.dat.bin').catch(e  => { setStatus('ip',  'error','GeoIP 加载失败');   throw e; }),
   ]);
 
   // Parse in WASM (once, cached)
