@@ -1196,6 +1196,9 @@ func parseNameServer(servers []string, respectRules bool, preferH3 bool) ([]dns.
 		case "udp":
 			addr, err = hostWithDefaultPort(u.Host, "53")
 			dnsNetType = "" // UDP
+		case "udpme":
+			addr, err = hostWithDefaultPort(u.Host, "53")
+			dnsNetType = "udpme"
 		case "tcp":
 			addr, err = hostWithDefaultPort(u.Host, "53")
 			dnsNetType = "tcp" // TCP
