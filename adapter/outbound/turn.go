@@ -17,6 +17,7 @@ import (
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/dns"
 )
 
 // STUN magic cookie (RFC 5389)
@@ -52,9 +53,10 @@ const (
 
 type Turn struct {
 	*Base
-	option *TurnOption
-	user   string
-	pass   string
+	option      *TurnOption
+	user        string
+	pass        string
+	dnsResolver resolver.Resolver
 }
 
 type TurnOption struct {
@@ -319,15 +321,30 @@ func NewTurn(option TurnOption) (*Turn, error) {
 		pass:   option.Password,
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
+
+	// Create a dedicated DNS resolver that routes queries through this TURN
+	// instance's own UDP relay, so target domains are resolved from the TURN
+	// server's network (trusted, unpolluted).
+	rs := dns.NewResolver(dns.Config{
+		Main: []dns.NameServer{
+			{Addr: "1.1.1.1:53", ProxyAdapter: outbound},
+			{Addr: "8.8.8.8:53", ProxyAdapter: outbound},
+		},
+	})
+	outbound.dnsResolver = rs.Resolver
+
 	return outbound, nil
 }
 
 // resolveTargetIP resolves the target address from metadata to a net.IP.
+// When the target is not yet resolved, it uses the TURN instance's own DNS
+// resolver which routes queries through the TURN UDP relay to 8.8.8.8,
+// avoiding local DNS pollution.
 func (t *Turn) resolveTargetIP(ctx context.Context, metadata *C.Metadata) (net.IP, error) {
 	if metadata.Resolved() {
 		return metadata.DstIP.AsSlice(), nil
 	}
-	ip, err := resolver.ResolveIP(ctx, metadata.Host)
+	ip, err := resolver.ResolveIPWithResolver(ctx, metadata.Host, t.dnsResolver)
 	if err != nil {
 		return nil, fmt.Errorf("turn: resolve target %s: %w", metadata.Host, err)
 	}
