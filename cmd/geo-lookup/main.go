@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"os/exec"
 	"regexp"
 	"sort"
 	"strings"
@@ -39,6 +40,7 @@ const (
 	// foreground colors
 	yellow = "33"
 	cyan   = "36"
+	green  = "32"
 )
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -46,21 +48,36 @@ const (
 func main() {
 	dirFlag     := flag.String("dir", "", "data directory containing GeoSite.dat and GeoIP.dat\n\t(default: ~/.config/mihomo/)")
 	noColorFlag := flag.Bool("no-color", false, "disable colored output")
+	listFlag    := flag.String("list", "", "list all rules in a category (e.g. GEOSITE,CN or GEOIP,CN)")
+	typeFlag    := flag.String("type", "", "filter by rule type: full, domain, keyword, regexp (only with --list GEOSITE,*)")
+	filterFlag  := flag.String("filter", "", "filter rules containing this substring (only with --list)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: geo-lookup [flags] <domain|IP>\n\nFlags:\n")
+		fmt.Fprintf(os.Stderr, "Usage: geo-lookup [flags] <domain|IP>\n       geo-lookup --list <GEOSITE,code|GEOIP,code> [--type TYPE] [--filter STR]\n\nFlags:\n")
 		flag.PrintDefaults()
 		fmt.Fprintln(os.Stderr, "\nExamples:")
 		fmt.Fprintln(os.Stderr, "  geo-lookup google.com")
 		fmt.Fprintln(os.Stderr, "  geo-lookup 8.8.8.8")
-		fmt.Fprintln(os.Stderr, "  geo-lookup -dir /etc/mihomo google.com")
-		fmt.Fprintln(os.Stderr, "  geo-lookup 2001:4860:4860::8888")
+		fmt.Fprintln(os.Stderr, "  geo-lookup --list GEOSITE,CN")
+		fmt.Fprintln(os.Stderr, "  geo-lookup --list GEOSITE,CN@ads --type domain --filter google")
+		fmt.Fprintln(os.Stderr, "  geo-lookup --list GEOIP,CN --filter 1.0")
 	}
 	flag.Parse()
 
+	isTTY := false
 	if !*noColorFlag && os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb" {
 		if stat, err := os.Stdout.Stat(); err == nil {
-			colorEnabled = (stat.Mode() & os.ModeCharDevice) != 0
+			isTTY = (stat.Mode() & os.ModeCharDevice) != 0
+			colorEnabled = isTTY
 		}
+	}
+
+	if *dirFlag != "" {
+		C.SetHomeDir(*dirFlag)
+	}
+
+	if *listFlag != "" {
+		listCategory(*listFlag, *typeFlag, *filterFlag, isTTY)
+		return
 	}
 
 	if flag.NArg() < 1 {
@@ -68,12 +85,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *dirFlag != "" {
-		C.SetHomeDir(*dirFlag)
-	}
-
 	input := flag.Arg(0)
-	host := extractHost(input) // extract bare host from any input format
+	host := extractHost(input)
 
 	if ip, err := netip.ParseAddr(host); err == nil {
 		lookupIP(ip.Unmap(), input)
@@ -94,41 +107,31 @@ func main() {
 //	8.8.8.8                      →  8.8.8.8 (unchanged)
 //	google.com                   →  google.com (unchanged)
 func extractHost(input string) string {
-	// URL with explicit scheme
 	if strings.Contains(input, "://") {
 		if u, err := url.Parse(input); err == nil && u.Hostname() != "" {
 			return u.Hostname()
 		}
 	}
-
-	// Protocol-relative URL: //host/path
 	if strings.HasPrefix(input, "//") {
 		if u, err := url.Parse(input); err == nil && u.Hostname() != "" {
 			return u.Hostname()
 		}
 	}
-
-	// host:port or [IPv6]:port — only when ":" present to avoid splitting plain IPv6
 	if strings.Contains(input, ":") {
-		// If it can be parsed as a bare IPv6 address, leave it alone
 		if _, err := netip.ParseAddr(input); err != nil {
 			if host, _, err := net.SplitHostPort(input); err == nil {
 				return host
 			}
 		}
 	}
-
-	// URL without scheme that has a path: example.com/path → example.com
 	if idx := strings.IndexByte(input, '/'); idx != -1 {
 		return input[:idx]
 	}
-
 	return input
 }
 
 // ── Domain helpers ────────────────────────────────────────────────────────────
 
-// matchedDomainEntries returns each Domain entry whose rule matches the given domain.
 func matchedDomainEntries(domain string, domains []*router.Domain) []*router.Domain {
 	var entries []*router.Domain
 	for _, d := range domains {
@@ -153,7 +156,6 @@ func matchedDomainEntries(domain string, domains []*router.Domain) []*router.Dom
 	return entries
 }
 
-// attrKeys returns the lowercase key of each attribute.
 func attrKeys(attrs []*router.Domain_Attribute) []string {
 	keys := make([]string, len(attrs))
 	for i, a := range attrs {
@@ -162,14 +164,12 @@ func attrKeys(attrs []*router.Domain_Attribute) []string {
 	return keys
 }
 
-// attrSig returns a stable map key for a set of attributes (sorted).
 func attrSig(attrs []*router.Domain_Attribute) string {
 	keys := attrKeys(attrs)
 	sort.Strings(keys)
 	return strings.Join(keys, "@")
 }
 
-// attrDisplay returns "@key1@key2" for the category code (original order).
 func attrDisplay(attrs []*router.Domain_Attribute) string {
 	if len(attrs) == 0 {
 		return ""
@@ -177,7 +177,6 @@ func attrDisplay(attrs []*router.Domain_Attribute) string {
 	return "@" + strings.Join(attrKeys(attrs), "@")
 }
 
-// coloredDomainRule formats "type:value" — attributes are shown in the category code, not here.
 func coloredDomainRule(d *router.Domain) string {
 	var prefix string
 	switch d.Type {
@@ -195,9 +194,23 @@ func coloredDomainRule(d *router.Domain) string {
 	return ansi(dim) + prefix + r() + d.Value
 }
 
+// domainTypeName returns the canonical type name for filtering.
+func domainTypeName(t router.Domain_Type) string {
+	switch t {
+	case router.Domain_Full:
+		return "full"
+	case router.Domain_Domain:
+		return "domain"
+	case router.Domain_Plain:
+		return "keyword"
+	case router.Domain_Regex:
+		return "regexp"
+	}
+	return ""
+}
+
 // ── IP helpers ────────────────────────────────────────────────────────────────
 
-// matchedCIDRs returns each CIDR in the entry that contains ip.
 func matchedCIDRs(ip netip.Addr, cidrs []*router.CIDR) []string {
 	var rules []string
 	for _, c := range cidrs {
@@ -216,7 +229,6 @@ func matchedCIDRs(ip netip.Addr, cidrs []*router.CIDR) []string {
 	return rules
 }
 
-// coloredCIDR formats a CIDR as "addr/bits" with /bits dimmed.
 func coloredCIDR(p netip.Prefix) string {
 	addr := p.Addr().String()
 	bits := fmt.Sprintf("%d", p.Bits())
@@ -225,8 +237,6 @@ func coloredCIDR(p netip.Prefix) string {
 
 // ── Output helpers ────────────────────────────────────────────────────────────
 
-// printQueryHeader prints the query line.
-// When original differs from query (e.g. URL was given), it shows the source dimly.
 func printQueryHeader(query, kind, original string) {
 	line := fmt.Sprintf("%sQuery:%s %s%s%s %s(%s)%s",
 		ansi(dim), r(),
@@ -241,7 +251,8 @@ func printQueryHeader(query, kind, original string) {
 }
 
 // printCategoryLine prints one matched category with its rules on the same line.
-//   GEOSITE,CN (5823)  →  domain:google.com  keyword:google
+//
+//	GEOSITE,CN (5823)  →  domain:google.com  keyword:google
 func printCategoryLine(ruleType, code string, total int, rules []string) {
 	line := fmt.Sprintf("  %s%s,%s%s%s%s %s(%d)%s",
 		ansi(dim), ruleType, r(),
@@ -255,17 +266,264 @@ func printCategoryLine(ruleType, code string, total int, rules []string) {
 	fmt.Println(line)
 }
 
-// printNoMatch prints the "no match" message.
 func printNoMatch(what string) {
 	fmt.Printf("%sNo matched %s categories.%s\n", ansi(dim), what, r())
 }
 
-// printSectionHeader prints "Matched X categories (N):".
 func printSectionHeader(what string, n int) {
 	fmt.Printf("Matched %s categories %s(%d)%s:\n",
 		what,
 		ansi(bold, yellow), n, r(),
 	)
+}
+
+// ── Pager ─────────────────────────────────────────────────────────────────────
+
+// withPager runs fn, piping its stdout through less when isTTY is true.
+func withPager(isTTY bool, fn func()) {
+	if !isTTY {
+		fn()
+		return
+	}
+	less, err := exec.LookPath("less")
+	if err != nil {
+		fn()
+		return
+	}
+	cmd := exec.Command(less, "-R", "-F", "-X")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		fn()
+		return
+	}
+	cmd.Stdin = pr
+
+	origStdout := os.Stdout
+	os.Stdout = pw
+
+	if err := cmd.Start(); err != nil {
+		os.Stdout = origStdout
+		pw.Close()
+		pr.Close()
+		fn()
+		return
+	}
+
+	fn()
+
+	pw.Close()
+	os.Stdout = origStdout
+	pr.Close()
+	cmd.Wait()
+}
+
+// ── List category ─────────────────────────────────────────────────────────────
+
+// listCategory prints all rules in the given category spec (e.g. "GEOSITE,CN" or "GEOIP,CN").
+// typeFilter: "full"/"domain"/"keyword"/"regexp" (empty = all; only for GEOSITE)
+// filterStr:  substring filter on rule value (empty = all)
+func listCategory(spec, typeFilter, filterStr string, isTTY bool) {
+	upper := strings.ToUpper(spec)
+	if strings.HasPrefix(upper, "GEOSITE,") {
+		code := spec[len("GEOSITE,"):]
+		withPager(isTTY, func() { listGeoSite(code, typeFilter, filterStr) })
+	} else if strings.HasPrefix(upper, "GEOIP,") {
+		code := spec[len("GEOIP,"):]
+		withPager(isTTY, func() { listGeoIP(code, filterStr) })
+	} else {
+		fmt.Fprintf(os.Stderr, "Error: --list must start with GEOSITE, or GEOIP, (got %q)\n", spec)
+		os.Exit(1)
+	}
+}
+
+func listGeoSite(codeSpec, typeFilter, filterStr string) {
+	// codeSpec may include attr suffix: "cn@ads"
+	attrFilter := ""
+	baseCode := strings.ToUpper(codeSpec)
+	if idx := strings.Index(baseCode, "@"); idx != -1 {
+		attrFilter = strings.ToLower(baseCode[idx+1:])
+		baseCode = baseCode[:idx]
+	}
+
+	path := C.Path.GeoSite()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: read GeoSite.dat from %s: %v\n", path, err)
+		os.Exit(1)
+	}
+	var list router.GeoSiteList
+	if err := proto.Unmarshal(data, &list); err != nil {
+		fmt.Fprintln(os.Stderr, "Error: parse GeoSite.dat:", err)
+		os.Exit(1)
+	}
+
+	var entry *router.GeoSite
+	for _, e := range list.Entry {
+		if strings.EqualFold(e.CountryCode, baseCode) {
+			entry = e
+			break
+		}
+	}
+	if entry == nil {
+		fmt.Fprintf(os.Stderr, "Error: category %q not found in GeoSite.dat\n", baseCode)
+		os.Exit(1)
+	}
+
+	// collect domains, applying attr/type/filter
+	var domains []*router.Domain
+	for _, d := range entry.Domain {
+		if attrFilter != "" {
+			keys := attrKeys(d.Attribute)
+			found := false
+			for _, k := range keys {
+				if k == attrFilter {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		}
+		if typeFilter != "" && domainTypeName(d.Type) != typeFilter {
+			continue
+		}
+		if filterStr != "" && !strings.Contains(strings.ToLower(d.Value), strings.ToLower(filterStr)) {
+			continue
+		}
+		domains = append(domains, d)
+	}
+
+	// count by type (before filter, but after attr filter)
+	var totalFull, totalDomain, totalKeyword, totalRegexp int
+	for _, d := range entry.Domain {
+		if attrFilter != "" {
+			keys := attrKeys(d.Attribute)
+			found := false
+			for _, k := range keys {
+				if k == attrFilter {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		}
+		switch d.Type {
+		case router.Domain_Full:
+			totalFull++
+		case router.Domain_Domain:
+			totalDomain++
+		case router.Domain_Plain:
+			totalKeyword++
+		case router.Domain_Regex:
+			totalRegexp++
+		}
+	}
+	totalAll := totalFull + totalDomain + totalKeyword + totalRegexp
+
+	displayCode := strings.ToLower(baseCode)
+	if attrFilter != "" {
+		displayCode += "@" + attrFilter
+	}
+
+	// header
+	fmt.Printf("%sCategory:%s %sGEOSITE,%s%s %s(%d)%s\n",
+		ansi(dim), r(),
+		ansi(bold, cyan), displayCode, r(),
+		ansi(dim), totalAll, r(),
+	)
+	fmt.Printf("  %sfull:%s %s%d%s   %sdomain:%s %s%d%s   %skeyword:%s %s%d%s   %sregexp:%s %s%d%s\n\n",
+		ansi(dim), r(), ansi(bold, green), totalFull, r(),
+		ansi(dim), r(), ansi(bold, green), totalDomain, r(),
+		ansi(dim), r(), ansi(bold, green), totalKeyword, r(),
+		ansi(dim), r(), ansi(bold, green), totalRegexp, r(),
+	)
+
+	if len(domains) == 0 {
+		fmt.Printf("%sNo rules match the given filters.%s\n", ansi(dim), r())
+		return
+	}
+
+	if typeFilter != "" || filterStr != "" {
+		fmt.Printf("%sShowing %d / %d rules%s\n\n", ansi(dim), len(domains), totalAll, r())
+	}
+
+	for _, d := range domains {
+		fmt.Println("  " + coloredDomainRule(d))
+	}
+}
+
+func listGeoIP(code, filterStr string) {
+	path := C.Path.GeoIP()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: read GeoIP.dat from %s: %v\n", path, err)
+		os.Exit(1)
+	}
+	var list router.GeoIPList
+	if err := proto.Unmarshal(data, &list); err != nil {
+		fmt.Fprintln(os.Stderr, "Error: parse GeoIP.dat:", err)
+		os.Exit(1)
+	}
+
+	var entry *router.GeoIP
+	for _, e := range list.Entry {
+		if strings.EqualFold(e.CountryCode, code) {
+			entry = e
+			break
+		}
+	}
+	if entry == nil {
+		fmt.Fprintf(os.Stderr, "Error: category %q not found in GeoIP.dat\n", code)
+		os.Exit(1)
+	}
+
+	// build all prefixes
+	type prefixEntry struct {
+		p   netip.Prefix
+		str string
+	}
+	var all []prefixEntry
+	for _, c := range entry.Cidr {
+		addr, ok := netip.AddrFromSlice(c.Ip)
+		if !ok {
+			continue
+		}
+		p := netip.PrefixFrom(addr, int(c.Prefix))
+		if !p.IsValid() {
+			continue
+		}
+		s := p.String()
+		if filterStr != "" && !strings.Contains(s, filterStr) {
+			continue
+		}
+		all = append(all, prefixEntry{p, s})
+	}
+
+	displayCode := strings.ToLower(code)
+	fmt.Printf("%sCategory:%s %sGEOIP,%s%s %s(%d)%s\n\n",
+		ansi(dim), r(),
+		ansi(bold, cyan), displayCode, r(),
+		ansi(dim), len(entry.Cidr), r(),
+	)
+
+	if filterStr != "" {
+		fmt.Printf("%sShowing %d / %d rules%s\n\n", ansi(dim), len(all), len(entry.Cidr), r())
+	}
+
+	if len(all) == 0 {
+		fmt.Printf("%sNo rules match the given filters.%s\n", ansi(dim), r())
+		return
+	}
+
+	for _, e := range all {
+		fmt.Println("  " + coloredCIDR(e.p))
+	}
 }
 
 // ── Lookup ────────────────────────────────────────────────────────────────────
@@ -301,8 +559,6 @@ func lookupDomain(domain, original string) {
 			continue
 		}
 
-		// ApplyDomain fast-rejects non-matching entries; matchedDomainEntries
-		// then retrieves the individual matching rules for display.
 		type group struct {
 			attrSuffix string
 			total      int
