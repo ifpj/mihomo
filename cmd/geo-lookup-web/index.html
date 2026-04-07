@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Geo Lookup</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --border: #2a2d3a;
+    --text: #e2e8f0;
+    --muted: #64748b;
+    --accent: #6366f1;
+    --accent-dim: #4338ca;
+    --green: #22c55e;
+    --yellow: #eab308;
+    --red: #ef4444;
+    --tag-bg: #1e2235;
+    --radius: 8px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 2rem 1rem;
+  }
+  .container { max-width: 720px; margin: 0 auto; }
+
+  h1 {
+    font-size: 1.5rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin-bottom: 0.25rem;
+  }
+  .subtitle { color: var(--muted); font-size: 0.875rem; margin-bottom: 2rem; }
+
+  /* Status bar */
+  .status-bar {
+    display: flex; gap: 1.25rem;
+    margin-bottom: 1.5rem;
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+  .status-item { display: flex; align-items: center; gap: 0.4rem; }
+  .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--muted); flex-shrink: 0;
+  }
+  .dot.loading { background: var(--yellow); animation: pulse 1s infinite; }
+  .dot.ready   { background: var(--green); }
+  .dot.error   { background: var(--red); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+  /* Search */
+  .search-row {
+    display: flex; gap: 0.75rem; margin-bottom: 2rem;
+  }
+  input {
+    flex: 1;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-size: 1rem;
+    padding: 0.625rem 1rem;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  input:focus { border-color: var(--accent); }
+  input::placeholder { color: var(--muted); }
+  button {
+    background: var(--accent);
+    border: none;
+    border-radius: var(--radius);
+    color: #fff;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 600;
+    padding: 0.625rem 1.25rem;
+    transition: background 0.15s, opacity 0.15s;
+    white-space: nowrap;
+  }
+  button:hover  { background: var(--accent-dim); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Results */
+  #results { display: flex; flex-direction: column; gap: 0; }
+
+  .query-header {
+    font-size: 0.8rem; color: var(--muted);
+    margin-bottom: 1rem;
+    display: flex; align-items: center; gap: 0.5rem;
+  }
+  .query-header strong { color: var(--text); font-weight: 600; }
+  .kind-badge {
+    font-size: 0.7rem; font-weight: 600;
+    padding: 0.15rem 0.45rem;
+    border-radius: 4px;
+    background: var(--tag-bg);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    text-transform: uppercase;
+  }
+
+  .no-match {
+    color: var(--muted); font-size: 0.9rem;
+    padding: 1.5rem 0;
+  }
+
+  .section-header {
+    font-size: 0.75rem; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--muted);
+    margin-bottom: 0.75rem;
+  }
+  .section-header span { color: var(--text); }
+
+  .result-list { display: flex; flex-direction: column; gap: 2px; }
+
+  .result-item {
+    display: flex; align-items: baseline;
+    gap: 0.75rem;
+    padding: 0.5rem 0.75rem;
+    border-radius: 6px;
+    font-size: 0.875rem;
+    transition: background 0.1s;
+  }
+  .result-item:hover { background: var(--surface); }
+
+  .rule-type {
+    font-size: 0.7rem; color: var(--muted); flex-shrink: 0;
+    font-weight: 500; letter-spacing: 0.04em;
+  }
+  .rule-code {
+    font-weight: 700; font-size: 0.9rem;
+    color: var(--accent);
+    min-width: 80px; flex-shrink: 0;
+  }
+  .rule-arrow { color: var(--border); flex-shrink: 0; }
+  .rule-tags  { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+  .tag {
+    font-size: 0.75rem; font-family: "SF Mono", "Fira Code", monospace;
+    padding: 0.1rem 0.45rem;
+    border-radius: 4px;
+    background: var(--tag-bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    white-space: nowrap;
+  }
+  .tag .prefix { color: var(--muted); }
+
+  .error-msg {
+    color: var(--red); font-size: 0.875rem;
+    padding: 0.75rem 1rem;
+    border: 1px solid color-mix(in srgb, var(--red) 30%, transparent);
+    border-radius: var(--radius);
+    background: color-mix(in srgb, var(--red) 8%, transparent);
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Geo Lookup</h1>
+  <p class="subtitle">查询域名或 IP 在 GeoSite / GeoIP 中的分类</p>
+
+  <div class="status-bar">
+    <div class="status-item">
+      <div class="dot loading" id="dot-site"></div>
+      <span id="label-site">GeoSite 加载中…</span>
+    </div>
+    <div class="status-item">
+      <div class="dot loading" id="dot-ip"></div>
+      <span id="label-ip">GeoIP 加载中…</span>
+    </div>
+  </div>
+
+  <div class="search-row">
+    <input id="query" type="text" placeholder="google.com 或 8.8.8.8" disabled
+           autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+    <button id="btn" onclick="search()" disabled>查询</button>
+  </div>
+
+  <div id="results"></div>
+</div>
+
+<script src="wasm_exec.js"></script>
+<script>
+// ── Service Worker ────────────────────────────────────────────────────────────
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+
+// ── WASM bootstrap ────────────────────────────────────────────────────────────
+const go = new Go();
+let wasmReady = false;
+let siteReady = false;
+let ipReady   = false;
+
+async function fetchBytes(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const buf = await res.arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+function setStatus(id, state, text) {
+  document.getElementById('dot-' + id).className = 'dot ' + state;
+  document.getElementById('label-' + id).textContent = text;
+}
+
+function checkReady() {
+  if (wasmReady && siteReady && ipReady) {
+    document.getElementById('query').disabled = false;
+    document.getElementById('btn').disabled   = false;
+    document.getElementById('query').focus();
+  }
+}
+
+(async () => {
+  // Load WASM
+  const wasmRes = await WebAssembly.instantiateStreaming(fetch('main.wasm'), go.importObject);
+  go.run(wasmRes.instance);   // starts main(), which registers geoInit / geoLookup
+  wasmReady = true;
+
+  // Load .dat files in parallel
+  const [siteData, ipData] = await Promise.all([
+    fetchBytes('GeoSite.dat').catch(e => { setStatus('site','error','GeoSite 加载失败'); throw e; }),
+    fetchBytes('GeoIP.dat').catch(e  => { setStatus('ip',  'error','GeoIP 加载失败');   throw e; }),
+  ]);
+
+  // Parse in WASM (once, cached)
+  const initResult = geoInit(siteData, ipData);
+  if (initResult !== 'ok') {
+    setStatus('site', 'error', initResult);
+    setStatus('ip',   'error', '');
+    return;
+  }
+
+  siteReady = true;
+  ipReady   = true;
+  setStatus('site', 'ready', 'GeoSite 已就绪');
+  setStatus('ip',   'ready', 'GeoIP 已就绪');
+  checkReady();
+})().catch(err => console.error('Init failed:', err));
+
+// ── Search ────────────────────────────────────────────────────────────────────
+document.getElementById('query').addEventListener('keydown', e => {
+  if (e.key === 'Enter') search();
+});
+
+function search() {
+  const q = document.getElementById('query').value.trim();
+  if (!q) return;
+
+  const out = document.getElementById('results');
+  out.innerHTML = '';
+
+  const raw = geoLookup(q);
+  let data;
+  try { data = JSON.parse(raw); } catch { renderError('解析结果失败'); return; }
+  if (data.error) { renderError(data.error); return; }
+
+  renderResults(data);
+}
+
+// ── Rendering ─────────────────────────────────────────────────────────────────
+function renderError(msg) {
+  document.getElementById('results').innerHTML =
+    `<div class="error-msg">${escHtml(msg)}</div>`;
+}
+
+function renderResults({ type, query, results }) {
+  const out = document.getElementById('results');
+
+  // Header
+  const kindLabel = type === 'ip' ? 'IP' : 'domain';
+  const ruleType  = type === 'ip' ? 'GEOIP' : 'GEOSITE';
+  out.innerHTML = `
+    <div class="query-header">
+      <strong>${escHtml(query)}</strong>
+      <span class="kind-badge">${kindLabel}</span>
+    </div>`;
+
+  if (!results || results.length === 0) {
+    out.innerHTML += `<div class="no-match">未匹配到任何分类。</div>`;
+    return;
+  }
+
+  out.innerHTML += `
+    <div class="section-header">
+      匹配到 <span>${results.length}</span> 个分类
+    </div>
+    <div class="result-list" id="list"></div>`;
+
+  const list = document.getElementById('list');
+  for (const r of results) {
+    const item = document.createElement('div');
+    item.className = 'result-item';
+
+    const tagsHtml = (r.rules && r.rules.length)
+      ? `<span class="rule-arrow">→</span><div class="rule-tags">${
+          r.rules.map(rule => {
+            const m = rule.match(/^([a-z]+:)(.+)$/);
+            return m
+              ? `<span class="tag"><span class="prefix">${escHtml(m[1])}</span>${escHtml(m[2])}</span>`
+              : `<span class="tag">${escHtml(rule)}</span>`;
+          }).join('')
+        }</div>`
+      : '';
+
+    item.innerHTML = `
+      <span class="rule-type">${escHtml(ruleType)},</span>
+      <span class="rule-code">${escHtml(r.code)}</span>
+      ${tagsHtml}`;
+    list.appendChild(item);
+  }
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+</script>
+</body>
+</html>
