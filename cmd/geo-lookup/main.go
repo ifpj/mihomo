@@ -321,10 +321,10 @@ func lookupDomain(domain, original string) {
 			}
 			groups[sig].rules = append(groups[sig].rules, rule)
 		}
-		matched = append(matched, result{strings.ToUpper(code), allRules})
+		matched = append(matched, result{code, allRules})
 		for _, sig := range order {
 			g := groups[sig]
-			matched = append(matched, result{strings.ToUpper(code) + strings.ToUpper(g.attrSuffix), g.rules})
+			matched = append(matched, result{code + g.attrSuffix, g.rules})
 		}
 	}
 
@@ -360,14 +360,14 @@ func lookupIP(ip netip.Addr, original string) {
 
 	if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
 		ip.IsMulticast() || ip.IsUnspecified() {
-		matched = append(matched, result{"LAN", nil})
+		matched = append(matched, result{"lan", nil})
 	}
 
 	for _, entry := range list.Entry {
 		code := strings.ToLower(entry.CountryCode)
 		cidrs := matchedCIDRs(ip, entry.Cidr)
 		if len(cidrs) > 0 {
-			matched = append(matched, result{strings.ToUpper(code), cidrs})
+			matched = append(matched, result{code, cidrs})
 		}
 	}
 
