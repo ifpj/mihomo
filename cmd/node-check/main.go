@@ -113,6 +113,8 @@ type NodeInfo struct {
 	IP           string
 	Delay        uint16
 	Config       map[string]any
+	// configHash caches the hash of config (excluding name) for deduplication
+	configHash string
 }
 
 func main() {
@@ -267,7 +269,29 @@ func main() {
 		return validResults[i].NewName < validResults[j].NewName
 	})
 
-	fmt.Printf("Valid lookups: %d / %d\n\n", len(validResults), len(results))
+	// Step 1: Remove completely duplicate nodes (same base name + same config hash)
+	// This must happen BEFORE deduplicateNames to avoid unnecessary hash suffixes
+	beforeDupRemoval := len(validResults)
+	validResults = removeDuplicateNodes(validResults)
+	removedDups := beforeDupRemoval - len(validResults)
+
+	// Step 2: Deduplicate names by appending config hash for nodes with same base name but different config
+	deduplicateNames(validResults)
+	hashedNames := 0
+	for _, r := range validResults {
+		if strings.Contains(r.NewName, "-") && len(r.configHash) > 0 && strings.HasSuffix(r.NewName, r.configHash) {
+			hashedNames++
+		}
+	}
+
+	fmt.Printf("Valid lookups: %d / %d", len(validResults), len(results))
+	if removedDups > 0 {
+		fmt.Printf(" (removed %d duplicates)", removedDups)
+	}
+	if hashedNames > 0 {
+		fmt.Printf(" [%d with hash suffix]", hashedNames)
+	}
+	fmt.Println("\n")
 
 	if len(validResults) == 0 {
 		fmt.Println("No valid IP lookups")
@@ -622,8 +646,69 @@ func queryIPInfo(ctx context.Context, proxy C.Proxy, name string, config map[str
 	info.ISP = isp
 	info.IP = ipResp.IP
 	info.NewName = fmt.Sprintf("%s %s %s", countryCode, isp, ipResp.IP)
+	// Pre-compute config hash for potential deduplication (excludes name field)
+	info.configHash = computeConfigHash(config)
 
 	return info
+}
+
+// computeConfigHash computes a short hash of the config excluding the name field
+func computeConfigHash(config map[string]any) string {
+	// Create a copy without the name field
+	cfgCopy := make(map[string]any, len(config))
+	for k, v := range config {
+		if k != "name" {
+			cfgCopy[k] = v
+		}
+	}
+	// Marshal to JSON for consistent hashing
+	data, err := json.Marshal(cfgCopy)
+	if err != nil {
+		return ""
+	}
+	h := sha256.Sum256(data)
+	return fmt.Sprintf("%x", h[:4]) // Use first 4 bytes (8 hex chars) for brevity
+}
+
+// deduplicateNames finds duplicate names and appends config hash to make them unique
+func deduplicateNames(results []NodeInfo) {
+	// Group by name
+	nameGroups := make(map[string][]int) // name -> indices in results
+	for i := range results {
+		name := results[i].NewName
+		nameGroups[name] = append(nameGroups[name], i)
+	}
+
+	// For each group with duplicates, append hash
+	for _, indices := range nameGroups {
+		if len(indices) <= 1 {
+			continue // No duplicates
+		}
+		for _, idx := range indices {
+			hash := results[idx].configHash
+			if hash != "" {
+				results[idx].NewName = fmt.Sprintf("%s-%s", results[idx].NewName, hash)
+			}
+		}
+	}
+}
+
+// removeDuplicateNodes removes nodes that have identical config hash
+// This removes completely identical nodes before adding hash suffixes to distinguish
+// nodes with the same IP but different configs
+func removeDuplicateNodes(results []NodeInfo) []NodeInfo {
+	seen := make(map[string]struct{})
+	var unique []NodeInfo
+	for _, r := range results {
+		// Use only config hash as key - nodes with identical configs are duplicates
+		// regardless of their current name
+		if _, ok := seen[r.configHash]; ok {
+			continue // Skip duplicate
+		}
+		seen[r.configHash] = struct{}{}
+		unique = append(unique, r)
+	}
+	return unique
 }
 
 // dialThroughProxy makes a request through the proxy to get IP info
