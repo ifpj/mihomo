@@ -131,6 +131,7 @@ func main() {
 	nodeFile := flag.String("i", "node.txt", "input file containing provider URLs or proxy data")
 	outputFile := flag.String("o", "", "output YAML file (default: <input>-checked.yaml)")
 	localMode := flag.Bool("local", false, "treat input file as proxy data directly (YAML or v2ray share links)")
+	parallelFetch := flag.Int("parallel", 1, "number of parallel fetch workers for downloading subscriptions (default: 1, serial)")
 	flag.Parse()
 
 	// Derive output filename from input if not specified
@@ -166,18 +167,10 @@ func main() {
 		fmt.Printf("Found %d provider URLs\n", len(providerURLs))
 
 		// Fetch and parse all proxies from all provider URLs
-		for _, u := range providerURLs {
-			mappings, fromCache, err := fetchProxies(u)
-			if err != nil {
-				fmt.Printf("Fetching %s ... FAILED: %v\n", u, err)
-				continue
-			}
-			tag := ""
-			if fromCache {
-				tag = " (cache)"
-			}
-			fmt.Printf("Fetching %s ... OK%s (%d proxies)\n", u, tag, len(mappings))
-			allMappings = append(allMappings, mappings...)
+		if *parallelFetch > 1 {
+			allMappings = fetchProxiesParallel(ctx, providerURLs, *parallelFetch)
+		} else {
+			allMappings = fetchProxiesSerial(providerURLs)
 		}
 	}
 
@@ -310,6 +303,95 @@ func readProviderURLs(path string) []string {
 	return urls
 }
 
+// fetchProxiesSerial fetches subscriptions one by one (default behavior)
+func fetchProxiesSerial(providerURLs []string) []map[string]any {
+	var allMappings []map[string]any
+	for _, u := range providerURLs {
+		mappings, fromCache, err := fetchProxies(u)
+		if err != nil {
+			fmt.Printf("Fetching %s ... FAILED: %v\n", u, err)
+			continue
+		}
+		tag := ""
+		if fromCache {
+			tag = " (cache)"
+		}
+		fmt.Printf("Fetching %s ... OK%s (%d proxies)\n", u, tag, len(mappings))
+		allMappings = append(allMappings, mappings...)
+	}
+	return allMappings
+}
+
+// fetchProxiesParallel fetches subscriptions concurrently with limited workers
+func fetchProxiesParallel(ctx context.Context, providerURLs []string, workers int) []map[string]any {
+	type result struct {
+		url       string
+		mappings  []map[string]any
+		fromCache bool
+		err       error
+	}
+
+	var wg sync.WaitGroup
+	urlChan := make(chan string, len(providerURLs))
+	resultChan := make(chan result, len(providerURLs))
+
+	// Start workers
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for u := range urlChan {
+				select {
+				case <-ctx.Done():
+					resultChan <- result{url: u, err: ctx.Err()}
+					return
+				default:
+					mappings, fromCache, err := fetchProxies(u)
+					resultChan <- result{url: u, mappings: mappings, fromCache: fromCache, err: err}
+				}
+			}
+		}()
+	}
+
+	// Send URLs to workers
+	go func() {
+		for _, u := range providerURLs {
+			urlChan <- u
+		}
+		close(urlChan)
+	}()
+
+	// Close result channel when all workers done
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results
+	var allMappings []map[string]any
+	var mu sync.Mutex
+	var doneCount atomic.Int32
+	total := len(providerURLs)
+
+	for res := range resultChan {
+		doneCount.Add(1)
+		if res.err != nil {
+			fmt.Printf("[%d/%d] Fetching %s ... FAILED: %v\n", doneCount.Load(), total, res.url, res.err)
+			continue
+		}
+		tag := ""
+		if res.fromCache {
+			tag = " (cache)"
+		}
+		fmt.Printf("[%d/%d] Fetching %s ... OK%s (%d proxies)\n", doneCount.Load(), total, res.url, tag, len(res.mappings))
+		mu.Lock()
+		allMappings = append(allMappings, res.mappings...)
+		mu.Unlock()
+	}
+
+	return allMappings
+}
+
 // fetchProxies downloads and parses a proxy subscription, with file-based caching.
 // Returns (mappings, fromCache, error).
 func fetchProxies(subURL string) ([]map[string]any, bool, error) {
@@ -340,7 +422,7 @@ func fetchProxies(subURL string) ([]map[string]any, bool, error) {
 
 // fetchRaw downloads the raw subscription data
 func fetchRaw(subURL string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, subURL, nil)
@@ -352,7 +434,7 @@ func fetchRaw(subURL string) ([]byte, error) {
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
+	client := &http.Client{Transport: transport, Timeout: 15 * time.Second}
 	defer client.CloseIdleConnections()
 
 	resp, err := client.Do(req)
