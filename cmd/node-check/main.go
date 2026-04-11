@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -348,7 +349,13 @@ func fetchRaw(subURL string) ([]byte, error) {
 	}
 	req.Header.Set("User-Agent", "ClashMeta/v2.11.5")
 
-	resp, err := http.DefaultClient.Do(req)
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
+	defer client.CloseIdleConnections()
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
