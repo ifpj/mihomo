@@ -149,45 +149,66 @@ func main() {
 		out = strings.TrimSuffix(inputFiles[0], filepath.Ext(inputFiles[0])) + "-checked.yaml"
 	}
 
-	// Fetch and parse all proxies from all input files
-	var allMappings []map[string]any
+	// Phase 1: Collect all subscription URLs and local files
+	fmt.Println("=== Phase 1: Collecting input sources ===")
+	var allProviderURLs []string
+	var localFiles []string
 
 	for _, nodeFile := range inputFiles {
-		// Detect input mode: if file contains any URL line, treat as subscription URLs
 		inputData, err := os.ReadFile(nodeFile)
 		if err != nil {
 			fmt.Printf("Failed to read %s: %v\n", nodeFile, err)
 			continue
 		}
 
-		localMode := isLocalMode(inputData)
+		if isLocalMode(inputData) {
+			// Local proxy config file
+			fmt.Printf("Local config file: %s\n", nodeFile)
+			localFiles = append(localFiles, nodeFile)
+		} else {
+			// Subscription URL file
+			urls := readProviderURLsFromData(inputData)
+			fmt.Printf("Subscription file: %s (%d URLs)\n", nodeFile, len(urls))
+			allProviderURLs = append(allProviderURLs, urls...)
+		}
+	}
 
-		if localMode {
-			// Read local proxy file directly
-			fmt.Printf("Reading local file %s ... ", nodeFile)
+	// Deduplicate subscription URLs
+	allProviderURLs = deduplicateStrings(allProviderURLs)
+	fmt.Printf("\nTotal unique subscription URLs: %d\n", len(allProviderURLs))
+	fmt.Printf("Total local config files: %d\n\n", len(localFiles))
+
+	// Phase 2: Fetch all subscriptions
+	var allMappings []map[string]any
+
+	if len(allProviderURLs) > 0 {
+		fmt.Println("=== Phase 2: Fetching subscriptions ===")
+		if *parallelFetch > 1 {
+			allMappings = fetchProxiesParallel(ctx, allProviderURLs, *parallelFetch)
+		} else {
+			allMappings = fetchProxiesSerial(allProviderURLs)
+		}
+		fmt.Printf("\nFetched %d proxies from subscriptions\n\n", len(allMappings))
+	}
+
+	// Phase 3: Parse local config files and merge
+	if len(localFiles) > 0 {
+		fmt.Println("=== Phase 3: Loading local config files ===")
+		for _, localFile := range localFiles {
+			inputData, err := os.ReadFile(localFile)
+			if err != nil {
+				fmt.Printf("Failed to read %s: %v\n", localFile, err)
+				continue
+			}
 			mappings, err := parseProxies(inputData)
 			if err != nil {
-				fmt.Printf("FAILED: %v\n", err)
+				fmt.Printf("Failed to parse %s: %v\n", localFile, err)
 				continue
 			}
-			fmt.Printf("OK (%d proxies)\n", len(mappings))
+			fmt.Printf("Loaded %d proxies from %s\n", len(mappings), localFile)
 			allMappings = append(allMappings, mappings...)
-		} else {
-			providerURLs := readProviderURLsFromData(inputData)
-			if len(providerURLs) == 0 {
-				fmt.Println("No provider URLs found in", nodeFile)
-				continue
-			}
-
-			fmt.Printf("Found %d provider URLs in %s\n", len(providerURLs), nodeFile)
-
-			// Fetch and parse all proxies from all provider URLs
-			if *parallelFetch > 1 {
-				allMappings = append(allMappings, fetchProxiesParallel(ctx, providerURLs, *parallelFetch)...)
-			} else {
-				allMappings = append(allMappings, fetchProxiesSerial(providerURLs)...)
-			}
 		}
+		fmt.Println()
 	}
 
 	if len(allMappings) == 0 {
@@ -319,6 +340,20 @@ func main() {
 	}
 
 	fmt.Printf("Written %d proxies to %s\n", len(validResults), out)
+}
+
+// deduplicateStrings removes duplicate strings from slice
+func deduplicateStrings(items []string) []string {
+	seen := make(map[string]struct{})
+	var result []string
+	for _, item := range items {
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		result = append(result, item)
+	}
+	return result
 }
 
 // isLocalMode detects if input data is local proxy config (YAML/v2ray links)
