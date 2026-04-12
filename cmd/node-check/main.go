@@ -115,9 +115,11 @@ func sortKeys(keys []string) {
 const (
 	defaultTestURL = "https://www.gstatic.com/generate_204"
 	ipinfoURL      = "https://ipinfo.io/json"
+	ipsbURL        = "https://api-ipv4.ip.sb/geoip"
 	ipwhoURL       = "https://ipwho.is/"
 	testTimeout    = 5 * time.Second
 	ipinfoTimeout  = 10 * time.Second
+	ipsbTimeout    = 10 * time.Second
 	ipwhoTimeout   = 10 * time.Second
 	cacheTTL       = 24 * time.Hour
 )
@@ -137,6 +139,7 @@ type NodeInfo struct {
 	IP           string
 	Delay        uint16
 	Config       map[string]any
+	APIUsed      string // 记录使用的 API
 	// configHash caches the hash of config (excluding name) for deduplication
 	configHash string
 }
@@ -420,6 +423,21 @@ func main() {
 		fmt.Printf(" [%d with hash suffix]", hashedNames)
 	}
 	fmt.Println("\n")
+
+	// Print API usage statistics
+	apiStats := make(map[string]int)
+	for _, r := range validResults {
+		if r.APIUsed != "" {
+			apiStats[r.APIUsed]++
+		}
+	}
+	if len(apiStats) > 0 {
+		fmt.Println("=== API 使用统计 ===")
+		for api, count := range apiStats {
+			fmt.Printf("  %s: %d\n", api, count)
+		}
+		fmt.Println()
+	}
 
 	if len(validResults) == 0 {
 		fmt.Println("No valid IP lookups")
@@ -799,6 +817,18 @@ func testConnectivity(ctx context.Context, proxies []C.Proxy, names []string, co
 	return aliveIndices
 }
 
+// IPSBResponse is the response from ip.sb (second fallback)
+type IPSBResponse struct {
+	IP          string `json:"ip"`
+	CountryCode string `json:"country_code"`
+	Country     string `json:"country"`
+	Region      string `json:"region"`
+	City        string `json:"city"`
+	ISP         string `json:"isp"`
+	ASN         int    `json:"asn"`
+	Org         string `json:"organization"`
+}
+
 // IPInfoResponse is the response from ipinfo.io (primary)
 type IPInfoResponse struct {
 	IP       string `json:"ip"`
@@ -811,7 +841,7 @@ type IPInfoResponse struct {
 	Timezone string `json:"timezone"`
 }
 
-// IPWhoResponse is the response from ipwho.is (fallback)
+// IPWhoResponse is the response from ipwho.is (third fallback)
 type IPWhoResponse struct {
 	IP            string `json:"ip"`
 	Success       bool   `json:"success"`
@@ -849,7 +879,7 @@ type IPWhoFullResponse struct {
 	Connection  IPWhoConnection `json:"connection"`
 }
 
-// queryIPInfo queries ipinfo.io through the proxy, with ipwho.is as fallback
+// queryIPInfo queries ipinfo.io through the proxy, with ip.sb and ipwho.is as fallbacks
 func queryIPInfo(ctx context.Context, proxy C.Proxy, name string, config map[string]any) NodeInfo {
 	info := NodeInfo{
 		OriginalName: name,
@@ -884,16 +914,51 @@ func queryIPInfo(ctx context.Context, proxy C.Proxy, name string, config map[str
 			info.ISP = isp
 			info.IP = ipResp.IP
 			info.NewName = fmt.Sprintf("%s %s %s", countryCode, isp, ipResp.IP)
+			info.APIUsed = "ipinfo.io"
 			info.configHash = computeConfigHash(config)
 			return info
 		}
 	}
 
-	// Fallback to ipwho.is
-	testCtx2, testCancel2 := context.WithTimeout(ctx, ipwhoTimeout)
+	// Fallback to ip.sb (second)
+	testCtx2, testCancel2 := context.WithTimeout(ctx, ipsbTimeout)
 	defer testCancel2()
 
-	respBody, err = dialThroughProxy(testCtx2, proxy, ipwhoURL)
+	respBody, err = dialThroughProxy(testCtx2, proxy, ipsbURL)
+	if err == nil {
+		var ipResp IPSBResponse
+		if err := json.Unmarshal(respBody, &ipResp); err == nil && ipResp.IP != "" {
+			countryCode := ipResp.CountryCode
+			if countryCode == "" {
+				countryCode = "XX"
+			}
+			countryCode = strings.ToUpper(countryCode)
+
+			// Use ISP field, fallback to Org
+			isp := normalizeISP(ipResp.ISP)
+			if isp == "" {
+				isp = normalizeISP(ipResp.Org)
+			}
+			if isp == "" {
+				isp = "Unknown"
+			}
+
+			info.CountryCode = countryCode
+			info.Country = ipResp.Country
+			info.ISP = isp
+			info.IP = ipResp.IP
+			info.NewName = fmt.Sprintf("%s %s %s", countryCode, isp, ipResp.IP)
+			info.APIUsed = "ip.sb"
+			info.configHash = computeConfigHash(config)
+			return info
+		}
+	}
+
+	// Fallback to ipwho.is (third)
+	testCtx3, testCancel3 := context.WithTimeout(ctx, ipwhoTimeout)
+	defer testCancel3()
+
+	respBody, err = dialThroughProxy(testCtx3, proxy, ipwhoURL)
 	if err != nil {
 		fmt.Printf("  SKIP %s: IP lookup failed: %v\n", name, err)
 		return info
@@ -932,6 +997,7 @@ func queryIPInfo(ctx context.Context, proxy C.Proxy, name string, config map[str
 	info.ISP = isp
 	info.IP = ipResp.IP
 	info.NewName = fmt.Sprintf("%s %s %s", countryCode, isp, ipResp.IP)
+	info.APIUsed = "ipwho.is"
 	// Pre-compute config hash for potential deduplication (excludes name field)
 	info.configHash = computeConfigHash(config)
 
