@@ -30,7 +30,30 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// preferredKeyOrder defines the desired order of YAML fields in each proxy entry.
+func init() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "用法: %s [选项] [输入文件...]\n\n", os.Args[0])
+		fmt.Fprintln(os.Stderr, "选项:")
+		fmt.Fprintln(os.Stderr, "  -o string")
+		fmt.Fprintln(os.Stderr, "        输出YAML文件路径 (默认: <第一个输入文件>-checked.yaml)")
+		fmt.Fprintln(os.Stderr, "  -parallel int")
+		fmt.Fprintln(os.Stderr, "        并行请求工作数 (默认 100)")
+		fmt.Fprintln(os.Stderr, "  -type string")
+		fmt.Fprintln(os.Stderr, "        按类型筛选节点,逗号分隔 (如: ss,vmess,trojan)")
+		fmt.Fprintln(os.Stderr, "  -exclude-type string")
+		fmt.Fprintln(os.Stderr, "        排除指定类型节点,逗号分隔 (如: ss,vmess)")
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "参数:")
+		fmt.Fprintln(os.Stderr, "  [输入文件...]    订阅链接文件或本地配置文件")
+		fmt.Fprintln(os.Stderr, "                   (默认: node.txt)")
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "示例:")
+		fmt.Fprintln(os.Stderr, "  node-check node.txt")
+		fmt.Fprintln(os.Stderr, "  node-check -o output.yaml sub1.txt sub2.txt")
+		fmt.Fprintln(os.Stderr, "  node-check -type ss,vmess node.txt")
+		fmt.Fprintln(os.Stderr, "  node-check -exclude-type hysteria2 -parallel 50 node.txt")
+	}
+}
 // Fields not listed here are appended at the end in their natural order.
 var preferredKeyOrder = []string{
 	"name",
@@ -133,6 +156,8 @@ func main() {
 	// Read input files from remaining args (after flags)
 	outputFile := flag.String("o", "", "output YAML file (default: <first-input>-checked.yaml)")
 	parallelFetch := flag.Int("parallel", 100, "number of parallel fetch workers (default: 100)")
+	filterType := flag.String("type", "", "filter proxies by type, comma-separated (e.g., ss,vmess,trojan)")
+	excludeType := flag.String("exclude-type", "", "exclude proxies by type, comma-separated (e.g., ss,vmess)")
 	flag.Parse()
 
 	// Get input files from flag or remaining args
@@ -251,12 +276,40 @@ func main() {
 	var proxyConfigs []map[string]any
 	var names []string
 
+	filterTypes := parseTypeList(*filterType)
+	excludeTypes := parseTypeList(*excludeType)
+
+	if len(filterTypes) > 0 && len(excludeTypes) > 0 {
+		fmt.Println("Error: cannot use -type and -exclude-type together")
+		os.Exit(1)
+	}
+
+	if len(filterTypes) > 0 {
+		fmt.Printf("Filtering by types: %v\n\n", filterTypes)
+	} else if len(excludeTypes) > 0 {
+		fmt.Printf("Excluding types: %v\n\n", excludeTypes)
+	}
+
 	for i, mapping := range uniqueMappings {
 		name, _ := mapping["name"].(string)
 		if name == "" {
 			name = fmt.Sprintf("proxy-%d", i)
 			mapping["name"] = name
 		}
+
+		proxyType, _ := mapping["type"].(string)
+		proxyTypeLower := strings.ToLower(proxyType)
+
+		// Filter by types if specified
+		if len(filterTypes) > 0 && !contains(filterTypes, proxyTypeLower) {
+			continue
+		}
+
+		// Exclude by types if specified
+		if len(excludeTypes) > 0 && contains(excludeTypes, proxyTypeLower) {
+			continue
+		}
+
 		p, err := adapter.ParseProxy(mapping)
 		if err != nil {
 			fmt.Printf("  SKIP %s: %v\n", name, err)
@@ -380,6 +433,32 @@ func main() {
 	}
 
 	fmt.Printf("Written %d proxies to %s\n", len(validResults), out)
+}
+
+// parseTypeList parses comma-separated type list into slice
+func parseTypeList(input string) []string {
+	if input == "" {
+		return nil
+	}
+	parts := strings.Split(input, ",")
+	var result []string
+	for _, p := range parts {
+		p = strings.TrimSpace(strings.ToLower(p))
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+// contains checks if slice contains item
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
 }
 
 // deduplicateStrings removes duplicate strings from slice (case-insensitive for URLs)
