@@ -168,14 +168,16 @@ func main() {
 		} else {
 			// Subscription URL file
 			urls := readProviderURLsFromData(inputData)
-			fmt.Printf("Subscription file: %s (%d URLs)\n", nodeFile, len(urls))
+			fmt.Printf("Subscription file: %s (%d URLs, %d unique in file)\n", nodeFile, len(urls), len(deduplicateStrings(urls)))
 			allProviderURLs = append(allProviderURLs, urls...)
 		}
 	}
 
+	fmt.Printf("\nTotal URLs before dedup: %d\n", len(allProviderURLs))
+
 	// Deduplicate subscription URLs
 	allProviderURLs = deduplicateStrings(allProviderURLs)
-	fmt.Printf("\nTotal unique subscription URLs: %d\n", len(allProviderURLs))
+	fmt.Printf("Total unique subscription URLs: %d\n", len(allProviderURLs))
 	fmt.Printf("Total local config files: %d\n\n", len(localFiles))
 
 	// Phase 2: Fetch all subscriptions
@@ -216,15 +218,27 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Deduplicate by name
+	// Deduplicate by config hash (not by name)
+	// This keeps nodes with same name but different configs
 	seen := make(map[string]struct{})
 	var uniqueMappings []map[string]any
 	for _, m := range allMappings {
-		name, _ := m["name"].(string)
-		if _, ok := seen[name]; ok {
+		// Compute hash excluding name field
+		hash := computeConfigHash(m)
+		if hash == "" {
+			// If hash computation fails, fallback to name-based dedup
+			name, _ := m["name"].(string)
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			uniqueMappings = append(uniqueMappings, m)
 			continue
 		}
-		seen[name] = struct{}{}
+		if _, ok := seen[hash]; ok {
+			continue // Skip same config
+		}
+		seen[hash] = struct{}{}
 		uniqueMappings = append(uniqueMappings, m)
 	}
 
@@ -342,15 +356,17 @@ func main() {
 	fmt.Printf("Written %d proxies to %s\n", len(validResults), out)
 }
 
-// deduplicateStrings removes duplicate strings from slice
+// deduplicateStrings removes duplicate strings from slice (case-insensitive for URLs)
 func deduplicateStrings(items []string) []string {
 	seen := make(map[string]struct{})
 	var result []string
 	for _, item := range items {
-		if _, ok := seen[item]; ok {
+		// Use lowercase for comparison to handle HTTP:// vs http://
+		key := strings.ToLower(item)
+		if _, ok := seen[key]; ok {
 			continue
 		}
-		seen[item] = struct{}{}
+		seen[key] = struct{}{}
 		result = append(result, item)
 	}
 	return result
@@ -365,21 +381,26 @@ func isLocalMode(data []byte) bool {
 		if line == "" {
 			continue
 		}
+		lowerLine := strings.ToLower(line)
 		// If any non-empty line starts with http:// or https://, treat as subscription URLs
-		if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
+		if strings.HasPrefix(lowerLine, "http://") || strings.HasPrefix(lowerLine, "https://") {
 			return false
 		}
 	}
 	return true // Default to local mode if no URLs found
 }
 
-// readProviderURLsFromData extracts HTTP URLs from byte data
+// readProviderURLsFromData extracts HTTP URLs from byte data (case-insensitive)
 func readProviderURLsFromData(data []byte) []string {
 	var urls []string
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
+		if line == "" {
+			continue
+		}
+		lowerLine := strings.ToLower(line)
+		if strings.HasPrefix(lowerLine, "http://") || strings.HasPrefix(lowerLine, "https://") {
 			urls = append(urls, line)
 		}
 	}
