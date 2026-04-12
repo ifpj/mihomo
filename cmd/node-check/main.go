@@ -285,22 +285,46 @@ func main() {
 	sem := make(chan struct{}, *parallelFetch)
 	var doneCount atomic.Int32
 
-	for _, idx := range aliveIndices {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(i int) {
-			defer wg.Done()
-			defer func() { <-sem }()
+	// Create a done channel to signal early exit
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for _, idx := range aliveIndices {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 
-			proxy := proxies[i]
-			info := queryIPInfo(ctx, proxy, names[i], proxyConfigs[i])
+			wg.Add(1)
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				wg.Done()
+				return
+			}
 
-			mu.Lock()
-			results = append(results, info)
-			doneCount.Add(1)
-			fmt.Printf("  [%d/%d] %s -> %s\n", doneCount.Load(), len(aliveIndices), names[i], info.NewName)
-			mu.Unlock()
-		}(idx)
+			go func(i int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				proxy := proxies[i]
+				info := queryIPInfo(ctx, proxy, names[i], proxyConfigs[i])
+
+				mu.Lock()
+				results = append(results, info)
+				doneCount.Add(1)
+				fmt.Printf("  [%d/%d] %s -> %s\n", doneCount.Load(), len(aliveIndices), names[i], info.NewName)
+				mu.Unlock()
+			}(idx)
+		}
+	}()
+
+	select {
+	case <-done:
+		// Normal completion
+	case <-ctx.Done():
+		fmt.Println("\n  IP lookup interrupted")
 	}
 
 	wg.Wait()
@@ -467,7 +491,6 @@ func fetchProxiesParallel(ctx context.Context, providerURLs []string, workers in
 			for u := range urlChan {
 				select {
 				case <-ctx.Done():
-					resultChan <- result{url: u, err: ctx.Err()}
 					return
 				default:
 					mappings, fromCache, err := fetchProxies(u)
@@ -480,7 +503,11 @@ func fetchProxiesParallel(ctx context.Context, providerURLs []string, workers in
 	// Send URLs to workers
 	go func() {
 		for _, u := range providerURLs {
-			urlChan <- u
+			select {
+			case urlChan <- u:
+			case <-ctx.Done():
+				break
+			}
 		}
 		close(urlChan)
 	}()
@@ -498,6 +525,15 @@ func fetchProxiesParallel(ctx context.Context, providerURLs []string, workers in
 	total := len(providerURLs)
 
 	for res := range resultChan {
+		if ctx.Err() != nil {
+			// Drain remaining results without processing
+			go func() {
+				for range resultChan {
+				}
+			}()
+			break
+		}
+
 		doneCount.Add(1)
 		if res.err != nil {
 			fmt.Printf("[%d/%d] Fetching %s ... FAILED: %v\n", doneCount.Load(), total, res.url, res.err)
@@ -627,31 +663,55 @@ func testConnectivity(ctx context.Context, proxies []C.Proxy, names []string, co
 	var doneCount atomic.Int32
 	total := len(proxies)
 
-	for i, p := range proxies {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(idx int, proxy C.Proxy) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			testCtx, testCancel := context.WithTimeout(ctx, testTimeout)
-			defer testCancel()
-
-			delay, err := proxy.URLTest(testCtx, defaultTestURL, nil)
-			alive := err == nil && delay > 0
-
-			mu.Lock()
-			if alive {
-				aliveIndices = append(aliveIndices, idx)
+	// Create a done channel to signal early exit
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i, p := range proxies {
+			select {
+			case <-ctx.Done():
+				return
+			default:
 			}
-			d := doneCount.Add(1)
-			status := "OK"
-			if !alive {
-				status = "FAIL"
+
+			wg.Add(1)
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				wg.Done()
+				return
 			}
-			fmt.Printf("  [%d/%d] %-30s %s (%dms)\n", d, total, names[idx], status, delay)
-			mu.Unlock()
-		}(i, p)
+
+			go func(idx int, proxy C.Proxy) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				testCtx, testCancel := context.WithTimeout(ctx, testTimeout)
+				defer testCancel()
+
+				delay, err := proxy.URLTest(testCtx, defaultTestURL, nil)
+				alive := err == nil && delay > 0
+
+				mu.Lock()
+				if alive {
+					aliveIndices = append(aliveIndices, idx)
+				}
+				d := doneCount.Add(1)
+				status := "OK"
+				if !alive {
+					status = "FAIL"
+				}
+				fmt.Printf("  [%d/%d] %-30s %s (%dms)\n", d, total, names[idx], status, delay)
+				mu.Unlock()
+			}(i, p)
+		}
+	}()
+
+	select {
+	case <-done:
+		// Normal completion
+	case <-ctx.Done():
+		fmt.Println("\n  Connectivity test interrupted")
 	}
 
 	wg.Wait()
