@@ -93,7 +93,6 @@ const (
 	defaultTestURL  = "https://www.gstatic.com/generate_204"
 	ipwhoURL        = "https://ipwho.is/"
 	testTimeout     = 5 * time.Second
-	testConcurrency = 20
 	ipwhoTimeout    = 10 * time.Second
 	cacheTTL        = 24 * time.Hour
 )
@@ -132,8 +131,7 @@ func main() {
 	// Read input file
 	nodeFile := flag.String("i", "node.txt", "input file containing provider URLs or proxy data")
 	outputFile := flag.String("o", "", "output YAML file (default: <input>-checked.yaml)")
-	localMode := flag.Bool("local", false, "treat input file as proxy data directly (YAML or v2ray share links)")
-	parallelFetch := flag.Int("parallel", 1, "number of parallel fetch workers for downloading subscriptions (default: 1, serial)")
+	parallelFetch := flag.Int("parallel", 100, "number of parallel fetch workers for downloading subscriptions (default: 100)")
 	flag.Parse()
 
 	// Derive output filename from input if not specified
@@ -144,15 +142,20 @@ func main() {
 
 	// Fetch and parse all proxies
 	var allMappings []map[string]any
-	if *localMode {
+
+	// Detect input mode: if file starts with http:// or https://, treat as subscription URLs
+	inputData, err := os.ReadFile(*nodeFile)
+	if err != nil {
+		fmt.Printf("Failed to read %s: %v\n", *nodeFile, err)
+		os.Exit(1)
+	}
+
+	localMode := isLocalMode(inputData)
+
+	if localMode {
 		// Read local proxy file directly
-		body, err := os.ReadFile(*nodeFile)
-		if err != nil {
-			fmt.Printf("Failed to read %s: %v\n", *nodeFile, err)
-			os.Exit(1)
-		}
 		fmt.Printf("Reading local file %s ... ", *nodeFile)
-		mappings, err := parseProxies(body)
+		mappings, err := parseProxies(inputData)
 		if err != nil {
 			fmt.Printf("FAILED: %v\n", err)
 			os.Exit(1)
@@ -220,7 +223,7 @@ func main() {
 
 	// Phase 1: Test connectivity
 	fmt.Println("=== Phase 1: Connectivity Test ===")
-	aliveIndices := testConnectivity(ctx, proxies, names)
+	aliveIndices := testConnectivity(ctx, proxies, names, *parallelFetch)
 	fmt.Printf("Alive: %d / %d\n\n", len(aliveIndices), len(proxies))
 
 	if len(aliveIndices) == 0 {
@@ -233,7 +236,7 @@ func main() {
 	var results []NodeInfo
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, testConcurrency)
+	sem := make(chan struct{}, *parallelFetch)
 	var doneCount atomic.Int32
 
 	for _, idx := range aliveIndices {
@@ -307,7 +310,24 @@ func main() {
 	fmt.Printf("Written %d proxies to %s\n", len(validResults), out)
 }
 
-// readProviderURLs reads the node-hk file and extracts HTTP URLs
+// isLocalMode detects if input data is local proxy config (YAML/v2ray links)
+// or subscription URLs by checking if any non-empty line starts with http:// or https://
+func isLocalMode(data []byte) bool {
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		// If any non-empty line starts with http:// or https://, treat as subscription URLs
+		if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
+			return false
+		}
+	}
+	return true // Default to local mode if no URLs found
+}
+
+// readProviderURLs reads the node file and extracts HTTP URLs
 func readProviderURLs(path string) []string {
 	f, err := os.Open(path)
 	if err != nil {
@@ -519,11 +539,11 @@ func writeCache(path string, data []map[string]any) error {
 }
 
 // testConnectivity tests all proxies concurrently
-func testConnectivity(ctx context.Context, proxies []C.Proxy, names []string) []int {
+func testConnectivity(ctx context.Context, proxies []C.Proxy, names []string, concurrency int) []int {
 	var aliveIndices []int
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, testConcurrency)
+	sem := make(chan struct{}, concurrency)
 	var doneCount atomic.Int32
 	total := len(proxies)
 
