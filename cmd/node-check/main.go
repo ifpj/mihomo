@@ -90,11 +90,13 @@ func sortKeys(keys []string) {
 }
 
 const (
-	defaultTestURL  = "https://www.gstatic.com/generate_204"
-	ipwhoURL        = "https://ipwho.is/"
-	testTimeout     = 5 * time.Second
-	ipwhoTimeout    = 10 * time.Second
-	cacheTTL        = 24 * time.Hour
+	defaultTestURL = "https://www.gstatic.com/generate_204"
+	ipinfoURL      = "https://ipinfo.io/json"
+	ipwhoURL       = "https://ipwho.is/"
+	testTimeout    = 5 * time.Second
+	ipinfoTimeout  = 10 * time.Second
+	ipwhoTimeout   = 10 * time.Second
+	cacheTTL       = 24 * time.Hour
 )
 
 // ProxySchema mirrors the internal schema for parsing
@@ -718,21 +720,33 @@ func testConnectivity(ctx context.Context, proxies []C.Proxy, names []string, co
 	return aliveIndices
 }
 
-// IPWhoResponse is the response from ipwho.is
+// IPInfoResponse is the response from ipinfo.io (primary)
+type IPInfoResponse struct {
+	IP       string `json:"ip"`
+	City     string `json:"city"`
+	Region   string `json:"region"`
+	Country  string `json:"country"`
+	Location string `json:"loc"`
+	Org      string `json:"org"`
+	Postal   string `json:"postal"`
+	Timezone string `json:"timezone"`
+}
+
+// IPWhoResponse is the response from ipwho.is (fallback)
 type IPWhoResponse struct {
-	IP         string `json:"ip"`
-	Success    bool   `json:"success"`
-	Type       string `json:"type"`
-	Continent  string `json:"continent"`
+	IP            string `json:"ip"`
+	Success       bool   `json:"success"`
+	Type          string `json:"type"`
+	Continent     string `json:"continent"`
 	ContinentCode string `json:"continent_code"`
-	Country    string `json:"country"`
-	CountryCode string `json:"country_code"`
-	Region     string `json:"region"`
-	City       string `json:"city"`
-	ISP        string `json:"connection",omitempty"`
-	ORG        string `json:"org"`
-	ASN        int    `json:"asn"`
-	Domain     string `json:"domain"`
+	Country       string `json:"country"`
+	CountryCode   string `json:"country_code"`
+	Region        string `json:"region"`
+	City          string `json:"city"`
+	ISP           string `json:"connection",omitempty"`
+	ORG           string `json:"org"`
+	ASN           int    `json:"asn"`
+	Domain        string `json:"domain"`
 }
 
 // Connection field from ipwho.is
@@ -745,29 +759,62 @@ type IPWhoConnection struct {
 }
 
 type IPWhoFullResponse struct {
-	IP           string            `json:"ip"`
-	Success      bool              `json:"success"`
-	Type         string            `json:"type"`
-	Continent    string            `json:"continent"`
-	Country      string            `json:"country"`
-	CountryCode  string            `json:"country_code"`
-	Region       string            `json:"region"`
-	City         string            `json:"city"`
-	Connection   IPWhoConnection   `json:"connection"`
+	IP          string          `json:"ip"`
+	Success     bool            `json:"success"`
+	Type        string          `json:"type"`
+	Continent   string          `json:"continent"`
+	Country     string          `json:"country"`
+	CountryCode string          `json:"country_code"`
+	Region      string          `json:"region"`
+	City        string          `json:"city"`
+	Connection  IPWhoConnection `json:"connection"`
 }
 
-// queryIPInfo queries ipwho.is through the proxy
+// queryIPInfo queries ipinfo.io through the proxy, with ipwho.is as fallback
 func queryIPInfo(ctx context.Context, proxy C.Proxy, name string, config map[string]any) NodeInfo {
 	info := NodeInfo{
 		OriginalName: name,
 		Config:       config,
 	}
 
-	testCtx, testCancel := context.WithTimeout(ctx, ipwhoTimeout)
+	// Try ipinfo.io first (primary)
+	testCtx, testCancel := context.WithTimeout(ctx, ipinfoTimeout)
 	defer testCancel()
 
-	// Try to get IP through the proxy by making a request
-	respBody, err := dialThroughProxy(testCtx, proxy)
+	respBody, err := dialThroughProxy(testCtx, proxy, ipinfoURL)
+	if err == nil {
+		var ipResp IPInfoResponse
+		if err := json.Unmarshal(respBody, &ipResp); err == nil && ipResp.IP != "" {
+			countryCode := ipResp.Country
+			if countryCode == "" {
+				countryCode = "XX"
+			}
+			countryCode = strings.ToUpper(countryCode)
+
+			// Extract ISP from org field (format: "ASXXXXX ISP Name")
+			isp := normalizeISPFromOrg(ipResp.Org)
+			if isp == "" {
+				isp = "Unknown"
+			}
+
+			info.CountryCode = countryCode
+			info.Country = ipResp.Region
+			if info.Country == "" {
+				info.Country = ipResp.City
+			}
+			info.ISP = isp
+			info.IP = ipResp.IP
+			info.NewName = fmt.Sprintf("%s %s %s", countryCode, isp, ipResp.IP)
+			info.configHash = computeConfigHash(config)
+			return info
+		}
+	}
+
+	// Fallback to ipwho.is
+	testCtx2, testCancel2 := context.WithTimeout(ctx, ipwhoTimeout)
+	defer testCancel2()
+
+	respBody, err = dialThroughProxy(testCtx2, proxy, ipwhoURL)
 	if err != nil {
 		fmt.Printf("  SKIP %s: IP lookup failed: %v\n", name, err)
 		return info
@@ -872,8 +919,8 @@ func removeDuplicateNodes(results []NodeInfo) []NodeInfo {
 }
 
 // dialThroughProxy makes a request through the proxy to get IP info
-func dialThroughProxy(ctx context.Context, proxy C.Proxy) ([]byte, error) {
-	u, err := url.Parse(ipwhoURL)
+func dialThroughProxy(ctx context.Context, proxy C.Proxy, targetURL string) ([]byte, error) {
+	u, err := url.Parse(targetURL)
 	if err != nil {
 		return nil, err
 	}
@@ -907,7 +954,7 @@ func dialThroughProxy(ctx context.Context, proxy C.Proxy) ([]byte, error) {
 	}
 	defer client.CloseIdleConnections()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ipwhoURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -939,6 +986,25 @@ func normalizeISP(isp string) string {
 		return "Unknown"
 	}
 	return isp
+}
+
+// normalizeISPFromOrg extracts ISP name from ipinfo.io org field
+// org format: "ASXXXXX ISP Name" or "AS9808 China Mobile Communications Group Co., Ltd."
+func normalizeISPFromOrg(org string) string {
+	if org == "" {
+		return "Unknown"
+	}
+	org = strings.TrimSpace(org)
+
+	// Remove AS number prefix (e.g., "AS9808 ")
+	if strings.HasPrefix(org, "AS") {
+		if idx := strings.Index(org, " "); idx > 0 {
+			org = strings.TrimSpace(org[idx+1:])
+		}
+	}
+
+	// Apply same normalization as normalizeISP
+	return normalizeISP(org)
 }
 
 // writeYAML writes the results in proxy-provider YAML format
