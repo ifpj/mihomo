@@ -128,54 +128,62 @@ func main() {
 		cancel()
 	}()
 
-	// Read input file
-	nodeFile := flag.String("i", "node.txt", "input file containing provider URLs or proxy data")
-	outputFile := flag.String("o", "", "output YAML file (default: <input>-checked.yaml)")
+	// Read input files (comma-separated)
+	nodeFiles := flag.String("i", "node.txt", "input file(s) containing provider URLs or proxy data (comma-separated for multiple files)")
+	outputFile := flag.String("o", "", "output YAML file (default: <first-input>-checked.yaml)")
 	parallelFetch := flag.Int("parallel", 100, "number of parallel fetch workers for downloading subscriptions (default: 100)")
 	flag.Parse()
 
-	// Derive output filename from input if not specified
+	// Parse input files
+	inputFiles := strings.Split(*nodeFiles, ",")
+	for i := range inputFiles {
+		inputFiles[i] = strings.TrimSpace(inputFiles[i])
+	}
+
+	// Derive output filename from first input if not specified
 	out := *outputFile
 	if out == "" {
-		out = strings.TrimSuffix(*nodeFile, filepath.Ext(*nodeFile)) + "-checked.yaml"
+		out = strings.TrimSuffix(inputFiles[0], filepath.Ext(inputFiles[0])) + "-checked.yaml"
 	}
 
-	// Fetch and parse all proxies
+	// Fetch and parse all proxies from all input files
 	var allMappings []map[string]any
 
-	// Detect input mode: if file starts with http:// or https://, treat as subscription URLs
-	inputData, err := os.ReadFile(*nodeFile)
-	if err != nil {
-		fmt.Printf("Failed to read %s: %v\n", *nodeFile, err)
-		os.Exit(1)
-	}
-
-	localMode := isLocalMode(inputData)
-
-	if localMode {
-		// Read local proxy file directly
-		fmt.Printf("Reading local file %s ... ", *nodeFile)
-		mappings, err := parseProxies(inputData)
+	for _, nodeFile := range inputFiles {
+		// Detect input mode: if file contains any URL line, treat as subscription URLs
+		inputData, err := os.ReadFile(nodeFile)
 		if err != nil {
-			fmt.Printf("FAILED: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("OK (%d proxies)\n", len(mappings))
-		allMappings = append(allMappings, mappings...)
-	} else {
-		providerURLs := readProviderURLs(*nodeFile)
-		if len(providerURLs) == 0 {
-			fmt.Println("No provider URLs found in", *nodeFile)
-			os.Exit(1)
+			fmt.Printf("Failed to read %s: %v\n", nodeFile, err)
+			continue
 		}
 
-		fmt.Printf("Found %d provider URLs\n", len(providerURLs))
+		localMode := isLocalMode(inputData)
 
-		// Fetch and parse all proxies from all provider URLs
-		if *parallelFetch > 1 {
-			allMappings = fetchProxiesParallel(ctx, providerURLs, *parallelFetch)
+		if localMode {
+			// Read local proxy file directly
+			fmt.Printf("Reading local file %s ... ", nodeFile)
+			mappings, err := parseProxies(inputData)
+			if err != nil {
+				fmt.Printf("FAILED: %v\n", err)
+				continue
+			}
+			fmt.Printf("OK (%d proxies)\n", len(mappings))
+			allMappings = append(allMappings, mappings...)
 		} else {
-			allMappings = fetchProxiesSerial(providerURLs)
+			providerURLs := readProviderURLsFromData(inputData)
+			if len(providerURLs) == 0 {
+				fmt.Println("No provider URLs found in", nodeFile)
+				continue
+			}
+
+			fmt.Printf("Found %d provider URLs in %s\n", len(providerURLs), nodeFile)
+
+			// Fetch and parse all proxies from all provider URLs
+			if *parallelFetch > 1 {
+				allMappings = append(allMappings, fetchProxiesParallel(ctx, providerURLs, *parallelFetch)...)
+			} else {
+				allMappings = append(allMappings, fetchProxiesSerial(providerURLs)...)
+			}
 		}
 	}
 
@@ -325,6 +333,19 @@ func isLocalMode(data []byte) bool {
 		}
 	}
 	return true // Default to local mode if no URLs found
+}
+
+// readProviderURLsFromData extracts HTTP URLs from byte data
+func readProviderURLsFromData(data []byte) []string {
+	var urls []string
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
+			urls = append(urls, line)
+		}
+	}
+	return urls
 }
 
 // readProviderURLs reads the node file and extracts HTTP URLs
