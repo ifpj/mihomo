@@ -128,16 +128,19 @@ func main() {
 		cancel()
 	}()
 
-	// Read input files (comma-separated)
-	nodeFiles := flag.String("i", "node.txt", "input file(s) containing provider URLs or proxy data (comma-separated for multiple files)")
+	// Read input files from remaining args (after flags)
 	outputFile := flag.String("o", "", "output YAML file (default: <first-input>-checked.yaml)")
-	parallelFetch := flag.Int("parallel", 100, "number of parallel fetch workers for downloading subscriptions (default: 100)")
+	parallelFetch := flag.Int("parallel", 100, "number of parallel fetch workers (default: 100)")
 	flag.Parse()
 
-	// Parse input files
-	inputFiles := strings.Split(*nodeFiles, ",")
-	for i := range inputFiles {
-		inputFiles[i] = strings.TrimSpace(inputFiles[i])
+	// Get input files from flag or remaining args
+	var inputFiles []string
+	if flag.NArg() > 0 {
+		// Use remaining positional args as input files
+		inputFiles = flag.Args()
+	} else {
+		// Default to node.txt if no files provided
+		inputFiles = []string{"node.txt"}
 	}
 
 	// Derive output filename from first input if not specified
