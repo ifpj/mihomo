@@ -48,6 +48,7 @@ const (
 	Sudoku
 	Masque
 	Turn
+	SSTP
 	TrustTunnel
 	OpenVPN
 	Tailscale
@@ -225,6 +226,8 @@ func (at AdapterType) String() string {
 		return "Masque"
 	case Turn:
 		return "Turn"
+	case SSTP:
+		return "SSTP"
 	case TrustTunnel:
 		return "TrustTunnel"
 	case OpenVPN:
