@@ -398,6 +398,24 @@ proxies: # socks5
     # private-key: ./client.key # 证书对应的私钥 PEM 格式，或者私钥路径
     # ip-version: dual
 
+  # SSTP（严格参考 Softether.js 的最小实现）
+  # 限制：仅支持 TCP、仅支持 IPv4 目标、不支持 UDP、仅支持 PAP 认证
+  - name: "sstp"
+    type: sstp
+    server: server
+    port: 443
+    # username: vpn # 默认值为 vpn
+    # password: vpn # 默认值为 vpn
+    # sni: custom.com
+    # skip-cert-verify: true
+    # fingerprint: xxxx
+    # certificate: ./client.crt
+    # private-key: ./client.key
+    # request-path: /sra_{BA195980-CD49-458b-9E23-C84EE0ADCD75}/ # 默认值同脚本
+    # remote-dns-resolve: false # 默认启用远程节点专用 TCP DNS；显式设为 false 可关闭
+    # dns: [tcp://8.8.8.8:53, tcp://1.1.1.1:53] # 不填时默认使用这两个 TCP DNS
+    # ip-version: ipv4
+
   # Snell
   - name: "snell"
     type: snell
