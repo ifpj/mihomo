@@ -173,6 +173,13 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 			break
 		}
 		proxy, err = outbound.NewTurn(*turnOption)
+	case "sstp":
+		sstpOption := &outbound.SSTPOption{BasicOption: basicOption}
+		err = decoder.Decode(mapping, sstpOption)
+		if err != nil {
+			break
+		}
+		proxy, err = outbound.NewSSTP(*sstpOption)
 	case "trusttunnel":
 		trustTunnelOption := &outbound.TrustTunnelOption{BasicOption: basicOption}
 		err = decoder.Decode(mapping, trustTunnelOption)
