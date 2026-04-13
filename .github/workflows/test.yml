@@ -1,17 +1,6 @@
 name: Test
 on:
-  push:
-    paths-ignore:
-      - "docs/**"
-      - "README.md"
-      - ".github/ISSUE_TEMPLATE/**"
-    branches:
-      - Alpha
-    tags:
-      - "v*"
-  pull_request:
-    branches:
-      - Alpha
+  workflow_dispatch:
 
 jobs:
   test:
