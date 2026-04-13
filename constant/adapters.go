@@ -49,6 +49,7 @@ const (
 	Sudoku
 	Masque
 	Turn
+	SSTP
 	TrustTunnel
 	ShadowQuic
 	OpenVPN
@@ -231,6 +232,8 @@ func (at AdapterType) String() string {
 		return "Masque"
 	case Turn:
 		return "Turn"
+	case SSTP:
+		return "SSTP"
 	case TrustTunnel:
 		return "TrustTunnel"
 	case ShadowQuic:
