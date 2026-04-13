@@ -32,28 +32,10 @@ import (
 
 func init() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "用法: %s [选项] [输入文件...]\n\n", os.Args[0])
-		fmt.Fprintln(os.Stderr, "选项:")
-		fmt.Fprintln(os.Stderr, "  -o string")
-		fmt.Fprintln(os.Stderr, "        输出YAML文件路径 (默认: <第一个输入文件>-checked.yaml)")
-		fmt.Fprintln(os.Stderr, "  -parallel int")
-		fmt.Fprintln(os.Stderr, "        并行请求工作数 (默认 100)")
-		fmt.Fprintln(os.Stderr, "  -type string")
-		fmt.Fprintln(os.Stderr, "        按类型筛选节点,逗号分隔 (如: ss,vmess,trojan)")
-		fmt.Fprintln(os.Stderr, "  -exclude-type string")
-		fmt.Fprintln(os.Stderr, "        排除指定类型节点,逗号分隔 (如: ss,vmess)")
-		fmt.Fprintln(os.Stderr)
-		fmt.Fprintln(os.Stderr, "参数:")
-		fmt.Fprintln(os.Stderr, "  [输入文件...]    订阅链接文件或本地配置文件")
-		fmt.Fprintln(os.Stderr, "                   (默认: node.txt)")
-		fmt.Fprintln(os.Stderr)
-		fmt.Fprintln(os.Stderr, "示例:")
-		fmt.Fprintln(os.Stderr, "  node-check node.txt")
-		fmt.Fprintln(os.Stderr, "  node-check -o output.yaml sub1.txt sub2.txt")
-		fmt.Fprintln(os.Stderr, "  node-check -type ss,vmess node.txt")
-		fmt.Fprintln(os.Stderr, "  node-check -exclude-type hysteria2 -parallel 50 node.txt")
+		writeHelp(os.Stderr)
 	}
 }
+
 // Fields not listed here are appended at the end in their natural order.
 var preferredKeyOrder = []string{
 	"name",
@@ -148,6 +130,11 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	if shouldShowInteractiveHelp(os.Args[1:]) {
+		showInteractiveHelp()
+		return
+	}
+
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -161,7 +148,18 @@ func main() {
 	parallelFetch := flag.Int("parallel", 100, "number of parallel fetch workers (default: 100)")
 	filterType := flag.String("type", "", "filter proxies by type, comma-separated (e.g., ss,vmess,trojan)")
 	excludeType := flag.String("exclude-type", "", "exclude proxies by type, comma-separated (e.g., ss,vmess)")
-	flag.Parse()
+	mergeMode := flag.Bool("merge", false, "merge checked YAML files without re-testing")
+	viewMode := flag.Bool("view", false, "show type and country statistics for input files")
+	filterCountry := flag.String("country", "", "filter proxies by country code")
+	excludeCountry := flag.String("exclude-country", "", "exclude proxies by country code")
+	normalizedArgs, err := normalizeArgs(os.Args[1:])
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(2)
+	}
+	if err := flag.CommandLine.Parse(normalizedArgs); err != nil {
+		os.Exit(2)
+	}
 
 	// Get input files from flag or remaining args
 	var inputFiles []string
@@ -176,7 +174,53 @@ func main() {
 	// Derive output filename from first input if not specified
 	out := *outputFile
 	if out == "" {
-		out = strings.TrimSuffix(inputFiles[0], filepath.Ext(inputFiles[0])) + "-checked.yaml"
+		suffix := "-checked.yaml"
+		if *mergeMode {
+			suffix = "-merged.yaml"
+		}
+		out = strings.TrimSuffix(inputFiles[0], filepath.Ext(inputFiles[0])) + suffix
+	}
+
+	countries := parseCountryList(*filterCountry)
+	excludeCountries := parseCountryList(*excludeCountry)
+	if len(countries) > 0 && len(excludeCountries) > 0 {
+		fmt.Println("Error: cannot use -country and -exclude-country together")
+		os.Exit(1)
+	}
+
+	filterTypes := parseTypeList(*filterType)
+	excludeTypes := parseTypeList(*excludeType)
+	if len(filterTypes) > 0 && len(excludeTypes) > 0 {
+		fmt.Println("Error: cannot use -type and -exclude-type together")
+		os.Exit(1)
+	}
+
+	if *viewMode {
+		if *mergeMode {
+			fmt.Println("Error: cannot use -view and -merge together")
+			os.Exit(1)
+		}
+		if *parallelFetch != 100 {
+			fmt.Println("Error: cannot use -parallel with -view")
+			os.Exit(1)
+		}
+		if out != strings.TrimSuffix(inputFiles[0], filepath.Ext(inputFiles[0]))+"-checked.yaml" && *outputFile != "" {
+			fmt.Println("Error: cannot use -o with -view")
+			os.Exit(1)
+		}
+		if err := viewInputFiles(inputFiles, filterTypes, excludeTypes, countries, excludeCountries); err != nil {
+			fmt.Printf("Failed to view input files: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *mergeMode {
+		if err := mergeCheckedFiles(inputFiles, out, filterTypes, excludeTypes, countries, excludeCountries); err != nil {
+			fmt.Printf("Failed to merge checked files: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	// Phase 1: Collect all subscription URLs and local files
@@ -279,18 +323,18 @@ func main() {
 	var proxyConfigs []map[string]any
 	var names []string
 
-	filterTypes := parseTypeList(*filterType)
-	excludeTypes := parseTypeList(*excludeType)
-
-	if len(filterTypes) > 0 && len(excludeTypes) > 0 {
-		fmt.Println("Error: cannot use -type and -exclude-type together")
-		os.Exit(1)
-	}
-
 	if len(filterTypes) > 0 {
-		fmt.Printf("Filtering by types: %v\n\n", filterTypes)
+		fmt.Printf("Filtering by types: %v\n", filterTypes)
 	} else if len(excludeTypes) > 0 {
-		fmt.Printf("Excluding types: %v\n\n", excludeTypes)
+		fmt.Printf("Excluding types: %v\n", excludeTypes)
+	}
+	if len(countries) > 0 {
+		fmt.Printf("Filtering by countries: %v\n", countries)
+	} else if len(excludeCountries) > 0 {
+		fmt.Printf("Excluding countries: %v\n", excludeCountries)
+	}
+	if len(filterTypes) > 0 || len(excludeTypes) > 0 || len(countries) > 0 || len(excludeCountries) > 0 {
+		fmt.Println()
 	}
 
 	for i, mapping := range uniqueMappings {
@@ -395,6 +439,8 @@ func main() {
 		}
 	}
 
+	validResults = filterCheckedResultsByCountry(validResults, countries, excludeCountries)
+
 	// Sort results by name (country code first since name starts with it)
 	sort.Slice(validResults, func(i, j int) bool {
 		return validResults[i].NewName < validResults[j].NewName
@@ -422,7 +468,8 @@ func main() {
 	if hashedNames > 0 {
 		fmt.Printf(" [%d with hash suffix]", hashedNames)
 	}
-	fmt.Println("\n")
+	fmt.Println()
+	fmt.Println()
 
 	// Print API usage statistics
 	apiStats := make(map[string]int)
@@ -453,6 +500,101 @@ func main() {
 	fmt.Printf("Written %d proxies to %s\n", len(validResults), out)
 }
 
+func shouldShowInteractiveHelp(args []string) bool {
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" || arg == "-help" {
+			return true
+		}
+	}
+	return false
+}
+
+func supportsColor(file *os.File) bool {
+	if file == nil {
+		return false
+	}
+	term := strings.ToLower(os.Getenv("TERM"))
+	return term != "" && term != "dumb"
+}
+
+func colorize(enabled bool, code string, text string) string {
+	if !enabled {
+		return text
+	}
+	return "\x1b[" + code + "m" + text + "\x1b[0m"
+}
+
+func renderHelp(colored bool) string {
+	var b strings.Builder
+	cmd := filepath.Base(os.Args[0])
+	section := func(title string) string {
+		return colorize(colored, "1;36", title)
+	}
+	flagName := func(name string) string {
+		return colorize(colored, "1;33", name)
+	}
+	code := func(text string) string {
+		return colorize(colored, "32", text)
+	}
+
+	fmt.Fprintf(&b, "%s %s [选项] [输入文件...]\n\n", section("用法:"), cmd)
+	fmt.Fprintf(&b, "%s\n", section("选项:"))
+	fmt.Fprintf(&b, "  %s\n", flagName("-o string"))
+	fmt.Fprintf(&b, "        输出YAML文件路径 (默认: 普通模式 <第一个输入文件>-checked.yaml, 合并模式 <第一个输入文件>-merged.yaml)\n")
+	fmt.Fprintf(&b, "  %s\n", flagName("-parallel int"))
+	fmt.Fprintf(&b, "        并行请求工作数 (默认 100, 仅普通模式)\n")
+	fmt.Fprintf(&b, "  %s\n", flagName("-type string"))
+	fmt.Fprintf(&b, "        按类型筛选节点,逗号分隔 (如: ss,vmess,trojan)\n")
+	fmt.Fprintf(&b, "  %s\n", flagName("-exclude-type string"))
+	fmt.Fprintf(&b, "        排除指定类型节点,逗号分隔 (如: ss,vmess)\n")
+	fmt.Fprintf(&b, "  %s\n", flagName("-country string"))
+	fmt.Fprintf(&b, "        按国家代码筛选节点,逗号分隔 (如: US,JP,HK)\n")
+	fmt.Fprintf(&b, "  %s\n", flagName("-exclude-country string"))
+	fmt.Fprintf(&b, "        排除指定国家代码,逗号分隔 (如: CN,RU)\n")
+	fmt.Fprintf(&b, "  %s\n", flagName("-merge"))
+	fmt.Fprintf(&b, "        合并已检查过的 YAML 文件,跳过测活和 IP 查询\n")
+	fmt.Fprintf(&b, "  %s\n", flagName("-view"))
+	fmt.Fprintf(&b, "        展示传入文件中的类型和国家代码统计,不写输出文件\n\n")
+
+	fmt.Fprintf(&b, "%s\n", section("说明:"))
+	fmt.Fprintf(&b, "  选项可以写在输入文件前面或后面\n")
+	fmt.Fprintf(&b, "  文件名若以 - 开头,请使用 -- 放在选项与文件之间\n")
+	fmt.Fprintf(&b, "  -type 与 -exclude-type 不能同时使用\n")
+	fmt.Fprintf(&b, "  -country 与 -exclude-country 不能同时使用\n")
+	fmt.Fprintf(&b, "  -merge 与 -view 不能同时使用\n")
+	fmt.Fprintf(&b, "  -merge 与 -view 模式下不能使用 -parallel\n")
+	fmt.Fprintf(&b, "  -view 模式下不写输出文件\n\n")
+
+	fmt.Fprintf(&b, "%s\n", section("参数:"))
+	fmt.Fprintf(&b, "  [输入文件...]    普通模式: 订阅链接文件或本地配置文件\n")
+	fmt.Fprintf(&b, "                   合并模式: 已检查过的 YAML 文件\n")
+	fmt.Fprintf(&b, "                   (默认: node.txt)\n\n")
+
+	fmt.Fprintf(&b, "%s\n", section("示例:"))
+	fmt.Fprintf(&b, "  普通检查:\n")
+	fmt.Fprintf(&b, "    %s\n", code(cmd+" node.txt"))
+	fmt.Fprintf(&b, "    %s\n", code(cmd+" -o output.yaml sub1.txt sub2.txt"))
+	fmt.Fprintf(&b, "    %s\n", code(cmd+" -type ss,vmess -country JP,US node.txt"))
+	fmt.Fprintf(&b, "    %s\n", code(cmd+" node.txt -exclude-type hysteria2 -exclude-country CN,RU -parallel 50"))
+	fmt.Fprintf(&b, "  查看统计:\n")
+	fmt.Fprintf(&b, "    %s\n", code(cmd+" -view node.txt"))
+	fmt.Fprintf(&b, "    %s\n", code(cmd+" a.yaml b.yaml -view -type ss -country JP,US"))
+	fmt.Fprintf(&b, "  合并已检查文件:\n")
+	fmt.Fprintf(&b, "    %s\n", code(cmd+" -merge -o merged.yaml a-checked.yaml b-checked.yaml"))
+	fmt.Fprintf(&b, "    %s\n", code(cmd+" a-checked.yaml b-checked.yaml -merge -type ss -country JP,US -o merged.yaml"))
+
+	return b.String()
+}
+
+func writeHelp(w io.Writer) {
+	_, _ = io.WriteString(w, renderHelp(false))
+}
+
+func showInteractiveHelp() {
+	coloured := supportsColor(os.Stdout)
+	_, _ = io.WriteString(os.Stdout, renderHelp(coloured))
+}
+
 // parseTypeList parses comma-separated type list into slice
 func parseTypeList(input string) []string {
 	if input == "" {
@@ -477,6 +619,136 @@ func contains(slice []string, item string) bool {
 		}
 	}
 	return false
+}
+
+func parseCountryList(input string) []string {
+	if input == "" {
+		return nil
+	}
+	parts := strings.Split(input, ",")
+	var result []string
+	for _, p := range parts {
+		p = strings.TrimSpace(strings.ToUpper(p))
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+func isKnownFlag(arg string) bool {
+	name := arg
+	if strings.HasPrefix(name, "--") {
+		name = strings.TrimPrefix(name, "--")
+	} else if strings.HasPrefix(name, "-") {
+		name = strings.TrimPrefix(name, "-")
+	} else {
+		return false
+	}
+	if idx := strings.IndexByte(name, '='); idx >= 0 {
+		name = name[:idx]
+	}
+
+	switch name {
+	case "o", "parallel", "type", "exclude-type", "country", "exclude-country", "merge", "view", "h", "help":
+		return true
+	default:
+		return false
+	}
+}
+
+func flagNeedsValue(arg string) bool {
+	name := arg
+	if strings.HasPrefix(name, "--") {
+		name = strings.TrimPrefix(name, "--")
+	} else if strings.HasPrefix(name, "-") {
+		name = strings.TrimPrefix(name, "-")
+	}
+	if idx := strings.IndexByte(name, '='); idx >= 0 {
+		return false
+	}
+
+	switch name {
+	case "o", "parallel", "type", "exclude-type", "country", "exclude-country":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeArgs(args []string) ([]string, error) {
+	var flags []string
+	var files []string
+	parsingFlags := true
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if parsingFlags && arg == "--" {
+			parsingFlags = false
+			continue
+		}
+		if parsingFlags && isKnownFlag(arg) {
+			flags = append(flags, arg)
+			if flagNeedsValue(arg) {
+				if i+1 >= len(args) {
+					return nil, fmt.Errorf("flag needs an argument: %s", arg)
+				}
+				i++
+				flags = append(flags, args[i])
+			}
+			continue
+		}
+		files = append(files, arg)
+	}
+
+	return append(flags, files...), nil
+}
+
+func countryCodeFromName(name string) string {
+	parts := strings.Fields(strings.TrimSpace(name))
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.ToUpper(parts[0])
+}
+
+func filterCheckedResultsByCountry(results []NodeInfo, countries []string, excludeCountries []string) []NodeInfo {
+	if len(countries) == 0 && len(excludeCountries) == 0 {
+		return results
+	}
+
+	filtered := make([]NodeInfo, 0, len(results))
+	for _, result := range results {
+		countryCode := countryCodeFromName(result.NewName)
+		if len(countries) > 0 && !contains(countries, countryCode) {
+			continue
+		}
+		if len(excludeCountries) > 0 && contains(excludeCountries, countryCode) {
+			continue
+		}
+		filtered = append(filtered, result)
+	}
+	return filtered
+}
+
+func filterProxyMappingsByType(mappings []map[string]any, filterTypes []string, excludeTypes []string) []map[string]any {
+	if len(filterTypes) == 0 && len(excludeTypes) == 0 {
+		return mappings
+	}
+
+	filtered := make([]map[string]any, 0, len(mappings))
+	for _, mapping := range mappings {
+		proxyType, _ := mapping["type"].(string)
+		proxyTypeLower := strings.ToLower(proxyType)
+		if len(filterTypes) > 0 && !contains(filterTypes, proxyTypeLower) {
+			continue
+		}
+		if len(excludeTypes) > 0 && contains(excludeTypes, proxyTypeLower) {
+			continue
+		}
+		filtered = append(filtered, mapping)
+	}
+	return filtered
 }
 
 // deduplicateStrings removes duplicate strings from slice (case-insensitive for URLs)
@@ -511,6 +783,188 @@ func isLocalMode(data []byte) bool {
 		}
 	}
 	return true // Default to local mode if no URLs found
+}
+
+func isCheckedOutput(data []byte) bool {
+	return bytes.Contains(data, []byte("# Generated by node-check"))
+}
+
+func loadCheckedResults(data []byte, filterTypes []string, excludeTypes []string) ([]NodeInfo, error) {
+	mappings, err := parseProxies(data)
+	if err != nil {
+		return nil, err
+	}
+	mappings = filterProxyMappingsByType(mappings, filterTypes, excludeTypes)
+
+	results := make([]NodeInfo, 0, len(mappings))
+	for i, mapping := range mappings {
+		name, _ := mapping["name"].(string)
+		if name == "" {
+			name = fmt.Sprintf("proxy-%d", i)
+			mapping["name"] = name
+		}
+		results = append(results, NodeInfo{
+			OriginalName: name,
+			NewName:      name,
+			Config:       mapping,
+			configHash:   computeConfigHash(mapping),
+		})
+	}
+
+	return results, nil
+}
+
+func printSortedStats(title string, stats map[string]int) {
+	fmt.Printf("=== %s ===\n", title)
+	if len(stats) == 0 {
+		fmt.Println("  (none)")
+		fmt.Println()
+		return
+	}
+
+	type statItem struct {
+		key   string
+		count int
+	}
+	items := make([]statItem, 0, len(stats))
+	for key, count := range stats {
+		items = append(items, statItem{key: key, count: count})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].count != items[j].count {
+			return items[i].count > items[j].count
+		}
+		return items[i].key < items[j].key
+	})
+	for _, item := range items {
+		fmt.Printf("  %-12s %d\n", item.key, item.count)
+	}
+	fmt.Println()
+}
+
+func viewInputFiles(inputFiles []string, filterTypes []string, excludeTypes []string, countries []string, excludeCountries []string) error {
+	fmt.Println("=== View Mode: Loading input files ===")
+	if len(filterTypes) > 0 {
+		fmt.Printf("Filtering view results by types: %v\n", filterTypes)
+	}
+	if len(excludeTypes) > 0 {
+		fmt.Printf("Excluding types from view results: %v\n", excludeTypes)
+	}
+	if len(countries) > 0 {
+		fmt.Printf("Filtering view results by countries: %v\n", countries)
+	}
+	if len(excludeCountries) > 0 {
+		fmt.Printf("Excluding countries from view results: %v\n", excludeCountries)
+	}
+	if len(filterTypes) > 0 || len(excludeTypes) > 0 || len(countries) > 0 || len(excludeCountries) > 0 {
+		fmt.Println()
+	}
+
+	typeStats := make(map[string]int)
+	countryStats := make(map[string]int)
+	total := 0
+
+	for _, inputFile := range inputFiles {
+		inputData, err := os.ReadFile(inputFile)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", inputFile, err)
+		}
+
+		mappings, err := parseProxies(inputData)
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", inputFile, err)
+		}
+		mappings = filterProxyMappingsByType(mappings, filterTypes, excludeTypes)
+
+		fileCount := 0
+		for _, mapping := range mappings {
+			proxyType, _ := mapping["type"].(string)
+			proxyTypeLower := strings.ToLower(proxyType)
+			if proxyTypeLower == "" {
+				proxyTypeLower = "unknown"
+			}
+
+			name, _ := mapping["name"].(string)
+			countryCode := countryCodeFromName(name)
+			if countryCode == "" {
+				countryCode = "UNKNOWN"
+			}
+			if len(countries) > 0 && !contains(countries, countryCode) {
+				continue
+			}
+			if len(excludeCountries) > 0 && contains(excludeCountries, countryCode) {
+				continue
+			}
+
+			typeStats[proxyTypeLower]++
+			countryStats[countryCode]++
+			fileCount++
+			total++
+		}
+		fmt.Printf("Loaded %d proxies from %s\n", fileCount, inputFile)
+	}
+
+	fmt.Println()
+	fmt.Printf("Total matched proxies: %d\n\n", total)
+	printSortedStats("Type Statistics", typeStats)
+	printSortedStats("Country Code Statistics", countryStats)
+	return nil
+}
+
+func mergeCheckedFiles(inputFiles []string, out string, filterTypes []string, excludeTypes []string, countries []string, excludeCountries []string) error {
+	fmt.Println("=== Merge Mode: Loading checked YAML files ===")
+	if len(filterTypes) > 0 {
+		fmt.Printf("Filtering merge results by types: %v\n", filterTypes)
+	}
+	if len(excludeTypes) > 0 {
+		fmt.Printf("Excluding types from merge results: %v\n", excludeTypes)
+	}
+	if len(countries) > 0 {
+		fmt.Printf("Filtering merge results by countries: %v\n", countries)
+	}
+	if len(excludeCountries) > 0 {
+		fmt.Printf("Excluding countries from merge results: %v\n", excludeCountries)
+	}
+
+	var allResults []NodeInfo
+	for _, inputFile := range inputFiles {
+		inputData, err := os.ReadFile(inputFile)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", inputFile, err)
+		}
+		if !isCheckedOutput(inputData) {
+			return fmt.Errorf("%s is not a node-check generated checked YAML file", inputFile)
+		}
+
+		results, err := loadCheckedResults(inputData, filterTypes, excludeTypes)
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", inputFile, err)
+		}
+		results = filterCheckedResultsByCountry(results, countries, excludeCountries)
+		fmt.Printf("Loaded %d checked proxies from %s\n", len(results), inputFile)
+		allResults = append(allResults, results...)
+	}
+
+	if len(allResults) == 0 {
+		return fmt.Errorf("no checked proxies found")
+	}
+
+	beforeDupRemoval := len(allResults)
+	allResults = removeDuplicateNodes(allResults)
+	removedDups := beforeDupRemoval - len(allResults)
+	deduplicateNames(allResults)
+
+	if err := writeYAML(allResults, out); err != nil {
+		return err
+	}
+
+	fmt.Printf("Merged %d proxies", len(allResults))
+	if removedDups > 0 {
+		fmt.Printf(" (removed %d duplicates)", removedDups)
+	}
+	fmt.Println()
+	fmt.Printf("Written merged proxies to %s\n", out)
+	return nil
 }
 
 // readProviderURLsFromData extracts HTTP URLs from byte data (case-insensitive)
@@ -716,8 +1170,8 @@ func parseProxies(body []byte) ([]map[string]any, error) {
 
 // cacheEntry is the on-disk cache format
 type cacheEntry struct {
-	At  time.Time          `json:"at"`
-	URL string             `json:"url"`
+	At   time.Time        `json:"at"`
+	URL  string           `json:"url"`
 	Data []map[string]any `json:"data"`
 }
 
