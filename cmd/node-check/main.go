@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -152,6 +153,7 @@ func main() {
 	viewMode := flag.Bool("view", false, "show type and country statistics for input files")
 	filterCountry := flag.String("country", "", "filter proxies by country code")
 	excludeCountry := flag.String("exclude-country", "", "exclude proxies by country code")
+	mergeHysteriaPorts := flag.Bool("merge-ports", false, "merge Hysteria/Hysteria2 nodes with same config but different ports")
 	normalizedArgs, err := normalizeArgs(os.Args[1:])
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
@@ -216,7 +218,7 @@ func main() {
 	}
 
 	if *mergeMode {
-		if err := mergeCheckedFiles(inputFiles, out, filterTypes, excludeTypes, countries, excludeCountries); err != nil {
+		if err := mergeCheckedFiles(inputFiles, out, filterTypes, excludeTypes, countries, excludeCountries, *mergeHysteriaPorts); err != nil {
 			fmt.Printf("Failed to merge checked files: %v\n", err)
 			os.Exit(1)
 		}
@@ -491,7 +493,18 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Phase 3: Write output
+	// Phase 3: Merge Hysteria/Hysteria2 ports if requested
+	if *mergeHysteriaPorts {
+		beforeMerge := len(validResults)
+		validResults = mergeHysteriaPortsByConfig(validResults)
+		merged := beforeMerge - len(validResults)
+		if merged > 0 {
+			fmt.Printf("Merged %d Hysteria/Hysteria2 nodes by ports\n", merged)
+		}
+		fmt.Println()
+	}
+
+	// Phase 4: Write output
 	if err := writeYAML(validResults, out); err != nil {
 		fmt.Printf("Failed to write output: %v\n", err)
 		os.Exit(1)
@@ -554,7 +567,9 @@ func renderHelp(colored bool) string {
 	fmt.Fprintf(&b, "  %s\n", flagName("-merge"))
 	fmt.Fprintf(&b, "        合并已检查过的 YAML 文件,跳过测活和 IP 查询\n")
 	fmt.Fprintf(&b, "  %s\n", flagName("-view"))
-	fmt.Fprintf(&b, "        展示传入文件中的类型和国家代码统计,不写输出文件\n\n")
+	fmt.Fprintf(&b, "        展示传入文件中的类型和国家代码统计,不写输出文件\n")
+	fmt.Fprintf(&b, "  %s\n", flagName("-merge-ports"))
+	fmt.Fprintf(&b, "        合并 Hysteria/Hysteria2 节点的端口 (相同配置不同端口合并为 ports 字段)\n\n")
 
 	fmt.Fprintf(&b, "%s\n", section("说明:"))
 	fmt.Fprintf(&b, "  选项可以写在输入文件前面或后面\n")
@@ -563,7 +578,8 @@ func renderHelp(colored bool) string {
 	fmt.Fprintf(&b, "  -country 与 -exclude-country 不能同时使用\n")
 	fmt.Fprintf(&b, "  -merge 与 -view 不能同时使用\n")
 	fmt.Fprintf(&b, "  -merge 与 -view 模式下不能使用 -parallel\n")
-	fmt.Fprintf(&b, "  -view 模式下不写输出文件\n\n")
+	fmt.Fprintf(&b, "  -view 模式下不写输出文件\n")
+	fmt.Fprintf(&b, "  -merge-ports 仅对 Hysteria/Hysteria2 协议有效\n\n")
 
 	fmt.Fprintf(&b, "%s\n", section("参数:"))
 	fmt.Fprintf(&b, "  [输入文件...]    普通模式: 订阅链接文件或本地配置文件\n")
@@ -576,6 +592,9 @@ func renderHelp(colored bool) string {
 	fmt.Fprintf(&b, "    %s\n", code(cmd+" -o output.yaml sub1.txt sub2.txt"))
 	fmt.Fprintf(&b, "    %s\n", code(cmd+" -type ss,vmess -country JP,US node.txt"))
 	fmt.Fprintf(&b, "    %s\n", code(cmd+" node.txt -exclude-type hysteria2 -exclude-country CN,RU -parallel 50"))
+	fmt.Fprintf(&b, "  端口合并:\n")
+	fmt.Fprintf(&b, "    %s\n", code(cmd+" -type hysteria2 -merge-ports node.txt"))
+	fmt.Fprintf(&b, "    %s\n", code(cmd+" -merge-ports -o output.yaml node.txt"))
 	fmt.Fprintf(&b, "  查看统计:\n")
 	fmt.Fprintf(&b, "    %s\n", code(cmd+" -view node.txt"))
 	fmt.Fprintf(&b, "    %s\n", code(cmd+" a.yaml b.yaml -view -type ss -country JP,US"))
@@ -650,7 +669,7 @@ func isKnownFlag(arg string) bool {
 	}
 
 	switch name {
-	case "o", "parallel", "type", "exclude-type", "country", "exclude-country", "merge", "view", "h", "help":
+	case "o", "parallel", "type", "exclude-type", "country", "exclude-country", "merge", "view", "merge-ports", "h", "help":
 		return true
 	default:
 		return false
@@ -911,7 +930,7 @@ func viewInputFiles(inputFiles []string, filterTypes []string, excludeTypes []st
 	return nil
 }
 
-func mergeCheckedFiles(inputFiles []string, out string, filterTypes []string, excludeTypes []string, countries []string, excludeCountries []string) error {
+func mergeCheckedFiles(inputFiles []string, out string, filterTypes []string, excludeTypes []string, countries []string, excludeCountries []string, mergeHysteriaPorts bool) error {
 	fmt.Println("=== Merge Mode: Loading checked YAML files ===")
 	if len(filterTypes) > 0 {
 		fmt.Printf("Filtering merge results by types: %v\n", filterTypes)
@@ -949,10 +968,30 @@ func mergeCheckedFiles(inputFiles []string, out string, filterTypes []string, ex
 		return fmt.Errorf("no checked proxies found")
 	}
 
+	// Sort results by name (country code first since name starts with it)
+	sort.Slice(allResults, func(i, j int) bool {
+		return allResults[i].NewName < allResults[j].NewName
+	})
+
 	beforeDupRemoval := len(allResults)
 	allResults = removeDuplicateNodes(allResults)
 	removedDups := beforeDupRemoval - len(allResults)
 	deduplicateNames(allResults)
+
+	// Apply port merging if requested
+	if mergeHysteriaPorts {
+		beforePortMerge := len(allResults)
+		allResults = mergeHysteriaPortsByConfig(allResults)
+		portMerged := beforePortMerge - len(allResults)
+		if portMerged > 0 {
+			fmt.Printf("Merged %d Hysteria/Hysteria2 nodes by ports\n", portMerged)
+		}
+	}
+
+	// Sort again after all processing
+	sort.Slice(allResults, func(i, j int) bool {
+		return allResults[i].NewName < allResults[j].NewName
+	})
 
 	if err := writeYAML(allResults, out); err != nil {
 		return err
@@ -1604,6 +1643,211 @@ func normalizeISPFromOrg(org string) string {
 
 	// Apply same normalization as normalizeISP
 	return normalizeISP(org)
+}
+
+// mergeHysteriaPortsByConfig merges Hysteria/Hysteria2 nodes that have identical configs except port
+// It combines them into single nodes with "ports" field containing comma-separated port list
+func mergeHysteriaPortsByConfig(results []NodeInfo) []NodeInfo {
+	// Group nodes by: type + config (excluding name and port)
+	type groupKey struct {
+		proxyType string
+		baseHash  string // hash of config excluding name, port, and ports fields
+	}
+
+	groups := make(map[groupKey][]int) // groupKey -> indices in results
+
+	for i, r := range results {
+		proxyType, ok := r.Config["type"].(string)
+		if !ok {
+			continue
+		}
+		proxyTypeLower := strings.ToLower(proxyType)
+
+		// Only process hysteria and hysteria2
+		if proxyTypeLower != "hysteria" && proxyTypeLower != "hysteria2" {
+			continue
+		}
+
+		// Compute hash excluding name, port, and ports
+		baseHash := computeBaseConfigHash(r.Config)
+		if baseHash == "" {
+			continue
+		}
+
+		key := groupKey{
+			proxyType: proxyTypeLower,
+			baseHash:  baseHash,
+		}
+		groups[key] = append(groups[key], i)
+	}
+
+	// Track which indices should be kept vs merged
+	merged := make(map[int]bool) // indices that were merged into another node
+	var newResults []NodeInfo
+
+	for _, indices := range groups {
+		if len(indices) <= 1 {
+			continue // No duplicates, skip
+		}
+
+		// Collect all ports from this group
+		var ports []int
+		portSet := make(map[int]struct{})
+
+		for _, idx := range indices {
+			if port, ok := results[idx].Config["port"].(int); ok {
+				if _, exists := portSet[port]; !exists {
+					ports = append(ports, port)
+					portSet[port] = struct{}{}
+				}
+			}
+		}
+
+		if len(ports) <= 1 {
+			continue // All same port or no valid ports
+		}
+
+		// Sort ports for consistent output
+		sort.Ints(ports)
+
+		// Use first node as base, merge ports into it
+		baseIdx := indices[0]
+		baseNode := results[baseIdx]
+
+		// Build ports string
+		portsStr := joinPorts(ports)
+
+		// Update config: remove single port, add ports field
+		delete(baseNode.Config, "port")
+		baseNode.Config["ports"] = portsStr
+
+		// Clean up name (remove hash suffix if present)
+		baseName := baseNode.NewName
+		// Remove hash suffix like "-b0709fa2" if present
+		if idx := strings.LastIndex(baseName, "-"); idx > 0 {
+			// Check if suffix looks like a hash (8 hex chars)
+			suffix := baseName[idx+1:]
+			if len(suffix) == 8 && isHexString(suffix) {
+				baseName = baseName[:idx]
+			}
+		}
+		baseNode.NewName = baseName
+
+		newResults = append(newResults, baseNode)
+
+		// Mark all nodes in this group as merged
+		for _, idx := range indices {
+			merged[idx] = true
+		}
+	}
+
+	// Add all non-merged nodes
+	for i, r := range results {
+		if !merged[i] {
+			newResults = append(newResults, r)
+		}
+	}
+
+	return newResults
+}
+
+// computeBaseConfigHash computes hash of config excluding name, port, and ports fields
+func computeBaseConfigHash(config map[string]any) string {
+	cfgCopy := make(map[string]any, len(config))
+	for k, v := range config {
+		if k != "name" && k != "port" && k != "ports" {
+			cfgCopy[k] = v
+		}
+	}
+	data, err := json.Marshal(cfgCopy)
+	if err != nil {
+		return ""
+	}
+	h := sha256.Sum256(data)
+	return fmt.Sprintf("%x", h[:4])
+}
+
+// joinPorts creates a compact port list string (e.g., "443,8443,10000")
+// If there are more than 28 ports (mihomo's limit), it compresses to "min-max" format
+func joinPorts(ports []int) string {
+	if len(ports) == 0 {
+		return ""
+	}
+
+	// mihomo has a limit of 28 ranges
+	// If we have more than 28 ports, compress to a single range: min-max
+	if len(ports) > 28 {
+		minPort := ports[0]
+		maxPort := ports[len(ports)-1]
+		return fmt.Sprintf("%d-%d", minPort, maxPort)
+	}
+
+	// Try to compress consecutive ports into ranges
+	compressed := compressPortRanges(ports)
+
+	// If compressed still has too many segments, fall back to min-max
+	if len(compressed) > 28 {
+		minPort := ports[0]
+		maxPort := ports[len(ports)-1]
+		return fmt.Sprintf("%d-%d", minPort, maxPort)
+	}
+
+	return strings.Join(compressed, ",")
+}
+
+// compressPortRanges compresses consecutive ports into ranges
+// e.g., [443, 444, 445, 8443, 10000, 10001] -> ["443-445", "8443", "10000-10001"]
+func compressPortRanges(ports []int) []string {
+	if len(ports) == 0 {
+		return nil
+	}
+
+	var result []string
+	start := ports[0]
+	end := ports[0]
+
+	for i := 1; i < len(ports); i++ {
+		if ports[i] == end+1 {
+			// Consecutive port, extend range
+			end = ports[i]
+		} else {
+			// Gap found, save current range
+			if start == end {
+				result = append(result, strconv.Itoa(start))
+			} else if end == start+1 {
+				// Only 2 consecutive ports, list them separately (shorter)
+				result = append(result, strconv.Itoa(start))
+				result = append(result, strconv.Itoa(end))
+			} else {
+				// 3+ consecutive ports, use range
+				result = append(result, fmt.Sprintf("%d-%d", start, end))
+			}
+			start = ports[i]
+			end = ports[i]
+		}
+	}
+
+	// Save last range
+	if start == end {
+		result = append(result, strconv.Itoa(start))
+	} else if end == start+1 {
+		result = append(result, strconv.Itoa(start))
+		result = append(result, strconv.Itoa(end))
+	} else {
+		result = append(result, fmt.Sprintf("%d-%d", start, end))
+	}
+
+	return result
+}
+
+// isHexString checks if a string contains only hexadecimal characters
+func isHexString(s string) bool {
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 // writeYAML writes the results in proxy-provider YAML format
