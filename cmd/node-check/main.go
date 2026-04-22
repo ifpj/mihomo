@@ -112,6 +112,12 @@ type ProxySchema struct {
 	Proxies []map[string]any `yaml:"proxies"`
 }
 
+// ProxyWithSource wraps a proxy config with its source URL
+type ProxyWithSource struct {
+	Config    map[string]any
+	SourceURL string
+}
+
 // NodeInfo stores the result of a checked node
 type NodeInfo struct {
 	OriginalName string
@@ -123,6 +129,7 @@ type NodeInfo struct {
 	Delay        uint16
 	Config       map[string]any
 	APIUsed      string // 记录使用的 API
+	SourceURL    string // 记录节点来源的订阅 URL
 	// configHash caches the hash of config (excluding name) for deduplication
 	configHash string
 }
@@ -154,6 +161,7 @@ func main() {
 	filterCountry := flag.String("country", "", "filter proxies by country code")
 	excludeCountry := flag.String("exclude-country", "", "exclude proxies by country code")
 	mergeHysteriaPorts := flag.Bool("merge-ports", false, "merge Hysteria/Hysteria2 nodes with same config but different ports")
+	trackSource := flag.Bool("track-source", false, "add source-url field to track subscription origin")
 	normalizedArgs, err := normalizeArgs(os.Args[1:])
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
@@ -257,16 +265,16 @@ func main() {
 	fmt.Printf("Total local config files: %d\n\n", len(localFiles))
 
 	// Phase 2: Fetch all subscriptions
-	var allMappings []map[string]any
+	var allProxiesWithSource []ProxyWithSource
 
 	if len(allProviderURLs) > 0 {
 		fmt.Println("=== Phase 2: Fetching subscriptions ===")
 		if *parallelFetch > 1 {
-			allMappings = fetchProxiesParallel(ctx, allProviderURLs, *parallelFetch)
+			allProxiesWithSource = fetchProxiesParallel(ctx, allProviderURLs, *parallelFetch)
 		} else {
-			allMappings = fetchProxiesSerial(allProviderURLs)
+			allProxiesWithSource = fetchProxiesSerial(allProviderURLs)
 		}
-		fmt.Printf("\nFetched %d proxies from subscriptions\n\n", len(allMappings))
+		fmt.Printf("\nFetched %d proxies from subscriptions\n\n", len(allProxiesWithSource))
 	}
 
 	// Phase 3: Parse local config files and merge
@@ -284,12 +292,18 @@ func main() {
 				continue
 			}
 			fmt.Printf("Loaded %d proxies from %s\n", len(mappings), localFile)
-			allMappings = append(allMappings, mappings...)
+			// Add local file proxies with source tracking
+			for _, m := range mappings {
+				allProxiesWithSource = append(allProxiesWithSource, ProxyWithSource{
+					Config:    m,
+					SourceURL: localFile,
+				})
+			}
 		}
 		fmt.Println()
 	}
 
-	if len(allMappings) == 0 {
+	if len(allProxiesWithSource) == 0 {
 		fmt.Println("No proxies found from any provider")
 		os.Exit(1)
 	}
@@ -297,32 +311,33 @@ func main() {
 	// Deduplicate by config hash (not by name)
 	// This keeps nodes with same name but different configs
 	seen := make(map[string]struct{})
-	var uniqueMappings []map[string]any
-	for _, m := range allMappings {
+	var uniqueProxiesWithSource []ProxyWithSource
+	for _, p := range allProxiesWithSource {
 		// Compute hash excluding name field
-		hash := computeConfigHash(m)
+		hash := computeConfigHash(p.Config)
 		if hash == "" {
 			// If hash computation fails, fallback to name-based dedup
-			name, _ := m["name"].(string)
+			name, _ := p.Config["name"].(string)
 			if _, ok := seen[name]; ok {
 				continue
 			}
 			seen[name] = struct{}{}
-			uniqueMappings = append(uniqueMappings, m)
+			uniqueProxiesWithSource = append(uniqueProxiesWithSource, p)
 			continue
 		}
 		if _, ok := seen[hash]; ok {
 			continue // Skip same config
 		}
 		seen[hash] = struct{}{}
-		uniqueMappings = append(uniqueMappings, m)
+		uniqueProxiesWithSource = append(uniqueProxiesWithSource, p)
 	}
 
-	fmt.Printf("\nTotal unique proxies: %d\n\n", len(uniqueMappings))
+	fmt.Printf("\nTotal unique proxies: %d\n\n", len(uniqueProxiesWithSource))
 
 	// Parse proxies
-	proxies := make([]C.Proxy, 0, len(uniqueMappings))
+	proxies := make([]C.Proxy, 0, len(uniqueProxiesWithSource))
 	var proxyConfigs []map[string]any
+	var sourceURLs []string
 	var names []string
 
 	if len(filterTypes) > 0 {
@@ -339,7 +354,8 @@ func main() {
 		fmt.Println()
 	}
 
-	for i, mapping := range uniqueMappings {
+	for i, proxyWithSource := range uniqueProxiesWithSource {
+		mapping := proxyWithSource.Config
 		name, _ := mapping["name"].(string)
 		if name == "" {
 			name = fmt.Sprintf("proxy-%d", i)
@@ -366,6 +382,7 @@ func main() {
 		}
 		proxies = append(proxies, p)
 		proxyConfigs = append(proxyConfigs, mapping)
+		sourceURLs = append(sourceURLs, proxyWithSource.SourceURL)
 		names = append(names, name)
 	}
 
@@ -414,6 +431,7 @@ func main() {
 
 				proxy := proxies[i]
 				info := queryIPInfo(ctx, proxy, names[i], proxyConfigs[i])
+				info.SourceURL = sourceURLs[i]
 
 				mu.Lock()
 				results = append(results, info)
@@ -505,7 +523,7 @@ func main() {
 	}
 
 	// Phase 4: Write output
-	if err := writeYAML(validResults, out); err != nil {
+	if err := writeYAML(validResults, out, *trackSource); err != nil {
 		fmt.Printf("Failed to write output: %v\n", err)
 		os.Exit(1)
 	}
@@ -569,7 +587,9 @@ func renderHelp(colored bool) string {
 	fmt.Fprintf(&b, "  %s\n", flagName("-view"))
 	fmt.Fprintf(&b, "        展示传入文件中的类型和国家代码统计,不写输出文件\n")
 	fmt.Fprintf(&b, "  %s\n", flagName("-merge-ports"))
-	fmt.Fprintf(&b, "        合并 Hysteria/Hysteria2 节点的端口 (相同配置不同端口合并为 ports 字段)\n\n")
+	fmt.Fprintf(&b, "        合并 Hysteria/Hysteria2 节点的端口 (相同配置不同端口合并为 ports 字段)\n")
+	fmt.Fprintf(&b, "  %s\n", flagName("-track-source"))
+	fmt.Fprintf(&b, "        添加 source-url 字段追踪订阅来源\n\n")
 
 	fmt.Fprintf(&b, "%s\n", section("说明:"))
 	fmt.Fprintf(&b, "  选项可以写在输入文件前面或后面\n")
@@ -669,7 +689,7 @@ func isKnownFlag(arg string) bool {
 	}
 
 	switch name {
-	case "o", "parallel", "type", "exclude-type", "country", "exclude-country", "merge", "view", "merge-ports", "h", "help":
+	case "o", "parallel", "type", "exclude-type", "country", "exclude-country", "merge", "view", "merge-ports", "track-source", "h", "help":
 		return true
 	default:
 		return false
@@ -993,7 +1013,7 @@ func mergeCheckedFiles(inputFiles []string, out string, filterTypes []string, ex
 		return allResults[i].NewName < allResults[j].NewName
 	})
 
-	if err := writeYAML(allResults, out); err != nil {
+	if err := writeYAML(allResults, out, false); err != nil {
 		return err
 	}
 
@@ -1044,8 +1064,8 @@ func readProviderURLs(path string) []string {
 }
 
 // fetchProxiesSerial fetches subscriptions one by one (default behavior)
-func fetchProxiesSerial(providerURLs []string) []map[string]any {
-	var allMappings []map[string]any
+func fetchProxiesSerial(providerURLs []string) []ProxyWithSource {
+	var allProxiesWithSource []ProxyWithSource
 	for _, u := range providerURLs {
 		mappings, fromCache, err := fetchProxies(u)
 		if err != nil {
@@ -1057,13 +1077,18 @@ func fetchProxiesSerial(providerURLs []string) []map[string]any {
 			tag = " (cache)"
 		}
 		fmt.Printf("Fetching %s ... OK%s (%d proxies)\n", u, tag, len(mappings))
-		allMappings = append(allMappings, mappings...)
+		for _, m := range mappings {
+			allProxiesWithSource = append(allProxiesWithSource, ProxyWithSource{
+				Config:    m,
+				SourceURL: u,
+			})
+		}
 	}
-	return allMappings
+	return allProxiesWithSource
 }
 
 // fetchProxiesParallel fetches subscriptions concurrently with limited workers
-func fetchProxiesParallel(ctx context.Context, providerURLs []string, workers int) []map[string]any {
+func fetchProxiesParallel(ctx context.Context, providerURLs []string, workers int) []ProxyWithSource {
 	type result struct {
 		url       string
 		mappings  []map[string]any
@@ -1111,7 +1136,7 @@ func fetchProxiesParallel(ctx context.Context, providerURLs []string, workers in
 	}()
 
 	// Collect results
-	var allMappings []map[string]any
+	var allProxiesWithSource []ProxyWithSource
 	var mu sync.Mutex
 	var doneCount atomic.Int32
 	total := len(providerURLs)
@@ -1137,11 +1162,16 @@ func fetchProxiesParallel(ctx context.Context, providerURLs []string, workers in
 		}
 		fmt.Printf("[%d/%d] Fetching %s ... OK%s (%d proxies)\n", doneCount.Load(), total, res.url, tag, len(res.mappings))
 		mu.Lock()
-		allMappings = append(allMappings, res.mappings...)
+		for _, m := range res.mappings {
+			allProxiesWithSource = append(allProxiesWithSource, ProxyWithSource{
+				Config:    m,
+				SourceURL: res.url,
+			})
+		}
 		mu.Unlock()
 	}
 
-	return allMappings
+	return allProxiesWithSource
 }
 
 // fetchProxies downloads and parses a proxy subscription, with file-based caching.
@@ -1851,7 +1881,7 @@ func isHexString(s string) bool {
 }
 
 // writeYAML writes the results in proxy-provider YAML format
-func writeYAML(results []NodeInfo, path string) error {
+func writeYAML(results []NodeInfo, path string, trackSource bool) error {
 	// Build the document using yaml.v3 Node for controlled key ordering
 	root := &yaml.Node{Kind: yaml.DocumentNode}
 	doc := &yaml.Node{Kind: yaml.MappingNode}
@@ -1889,6 +1919,14 @@ func writeYAML(results []NodeInfo, path string) error {
 				valNode.Value = fmt.Sprintf("%v", r.Config[k])
 			}
 			proxyNode.Content = append(proxyNode.Content, keyNode, valNode)
+		}
+
+		// Add source-url field if tracking is enabled and source is available
+		if trackSource && r.SourceURL != "" {
+			proxyNode.Content = append(proxyNode.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Value: "source-url"},
+				&yaml.Node{Kind: yaml.ScalarNode, Value: r.SourceURL},
+			)
 		}
 
 		seq.Content = append(seq.Content, proxyNode)
