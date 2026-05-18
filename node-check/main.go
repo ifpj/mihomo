@@ -186,6 +186,7 @@ func main() {
 	mergeHysteriaPorts := flag.Bool("merge-ports", false, "merge Hysteria/Hysteria2 nodes with same config but different ports")
 	trackSource := flag.Bool("track-source", false, "add source-url field to track subscription origin")
 	scoreMode := flag.Bool("score", false, "score mode: query fraud score for each proxy")
+	pruneMode := flag.Bool("prune", false, "prune mode: remove dead nodes from checked/scored YAML")
 	normalizedArgs, err := normalizeArgs(os.Args[1:])
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
@@ -211,6 +212,8 @@ func main() {
 		suffix := "-checked.yaml"
 		if *mergeMode {
 			suffix = "-merged.yaml"
+		} else if *pruneMode {
+			suffix = "-pruned.yaml"
 		}
 		out = strings.TrimSuffix(inputFiles[0], filepath.Ext(inputFiles[0])) + suffix
 	}
@@ -234,6 +237,10 @@ func main() {
 			fmt.Println("Error: cannot use -view and -merge together")
 			os.Exit(1)
 		}
+		if *pruneMode {
+			fmt.Println("Error: cannot use -view and -prune together")
+			os.Exit(1)
+		}
 		if *parallelFetch != 100 {
 			fmt.Println("Error: cannot use -parallel with -view")
 			os.Exit(1)
@@ -252,6 +259,14 @@ func main() {
 	if *mergeMode {
 		if err := mergeCheckedFiles(inputFiles, out, filterTypes, excludeTypes, countries, excludeCountries, *mergeHysteriaPorts); err != nil {
 			fmt.Printf("Failed to merge checked files: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *pruneMode {
+		if err := pruneDeadNodes(ctx, inputFiles, out, *parallelFetch); err != nil {
+			fmt.Printf("Failed to prune dead nodes: %v\n", err)
 			os.Exit(1)
 		}
 		return
@@ -622,21 +637,25 @@ func renderHelp(colored bool) string {
 	fmt.Fprintf(&b, "  %s\n", flagName("-merge-ports"))
 	fmt.Fprintf(&b, "        合并 Hysteria/Hysteria2 节点的端口 (相同配置不同端口合并为 ports 字段)\n")
 	fmt.Fprintf(&b, "  %s\n", flagName("-track-source"))
-	fmt.Fprintf(&b, "        添加 source-url 字段追踪订阅来源\n\n")
+	fmt.Fprintf(&b, "        添加 source-url 字段追踪订阅来源\n")
+	fmt.Fprintf(&b, "  %s\n", flagName("-prune"))
+	fmt.Fprintf(&b, "        修剪模式: 读取已检查/已评分的YAML,移除不可用节点,保留分数\n\n")
 
 	fmt.Fprintf(&b, "%s\n", section("说明:"))
 	fmt.Fprintf(&b, "  选项可以写在输入文件前面或后面\n")
 	fmt.Fprintf(&b, "  文件名若以 - 开头,请使用 -- 放在选项与文件之间\n")
 	fmt.Fprintf(&b, "  -type 与 -exclude-type 不能同时使用\n")
 	fmt.Fprintf(&b, "  -country 与 -exclude-country 不能同时使用\n")
-	fmt.Fprintf(&b, "  -merge 与 -view 不能同时使用\n")
+	fmt.Fprintf(&b, "  -merge, -view, -prune 两两不能同时使用\n")
 	fmt.Fprintf(&b, "  -merge 与 -view 模式下不能使用 -parallel\n")
 	fmt.Fprintf(&b, "  -view 模式下不写输出文件\n")
+	fmt.Fprintf(&b, "  -prune 模式下不能使用 -type, -exclude-type, -country, -exclude-country\n")
 	fmt.Fprintf(&b, "  -merge-ports 仅对 Hysteria/Hysteria2 协议有效\n\n")
 
 	fmt.Fprintf(&b, "%s\n", section("参数:"))
 	fmt.Fprintf(&b, "  [输入文件...]    普通模式: 订阅链接文件或本地配置文件\n")
 	fmt.Fprintf(&b, "                   合并模式: 已检查过的 YAML 文件\n")
+	fmt.Fprintf(&b, "                   修剪模式: 已检查/已评分的 YAML 文件\n")
 	fmt.Fprintf(&b, "                   (默认: node.txt)\n\n")
 
 	fmt.Fprintf(&b, "%s\n", section("示例:"))
@@ -654,6 +673,9 @@ func renderHelp(colored bool) string {
 	fmt.Fprintf(&b, "  合并已检查文件:\n")
 	fmt.Fprintf(&b, "    %s\n", code(cmd+" -merge -o merged.yaml a-checked.yaml b-checked.yaml"))
 	fmt.Fprintf(&b, "    %s\n", code(cmd+" a-checked.yaml b-checked.yaml -merge -type ss -country JP,US -o merged.yaml"))
+	fmt.Fprintf(&b, "  修剪不可用节点:\n")
+	fmt.Fprintf(&b, "    %s\n", code(cmd+" -prune scored.yaml"))
+	fmt.Fprintf(&b, "    %s\n", code(cmd+" -prune -parallel 50 -o alive.yaml scored.yaml"))
 
 	return b.String()
 }
@@ -722,7 +744,7 @@ func isKnownFlag(arg string) bool {
 	}
 
 	switch name {
-	case "o", "parallel", "type", "exclude-type", "country", "exclude-country", "merge", "view", "merge-ports", "track-source", "h", "help":
+	case "o", "parallel", "type", "exclude-type", "country", "exclude-country", "merge", "view", "merge-ports", "track-source", "score", "prune", "h", "help":
 		return true
 	default:
 		return false
@@ -1056,6 +1078,86 @@ func mergeCheckedFiles(inputFiles []string, out string, filterTypes []string, ex
 	}
 	fmt.Println()
 	fmt.Printf("Written merged proxies to %s\n", out)
+	return nil
+}
+
+// pruneDeadNodes reads checked/scored YAML files, tests connectivity, and keeps only alive nodes.
+// Original names (including fraud scores like "⭐95") are preserved.
+func pruneDeadNodes(ctx context.Context, inputFiles []string, out string, parallel int) error {
+	fmt.Println("=== Prune Mode: Removing dead nodes ===")
+
+	var allMappings []map[string]any
+	for _, f := range inputFiles {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", f, err)
+		}
+		mappings, err := parseProxies(data)
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", f, err)
+		}
+		fmt.Printf("Loaded %d proxies from %s\n", len(mappings), f)
+		allMappings = append(allMappings, mappings...)
+	}
+
+	if len(allMappings) == 0 {
+		return fmt.Errorf("no proxies found")
+	}
+
+	// Parse proxies for connectivity testing
+	var proxies []C.Proxy
+	var names []string
+	var configs []map[string]any
+
+	for i, m := range allMappings {
+		name, _ := m["name"].(string)
+		if name == "" {
+			name = fmt.Sprintf("proxy-%d", i)
+			m["name"] = name
+		}
+
+		p, err := adapter.ParseProxy(m)
+		if err != nil {
+			fmt.Printf("  SKIP %s: %v\n", name, err)
+			continue
+		}
+		proxies = append(proxies, p)
+		names = append(names, name)
+		configs = append(configs, m)
+	}
+
+	fmt.Printf("\nParsed %d proxies\n\n", len(proxies))
+
+	// Test connectivity
+	aliveIndices := testConnectivity(ctx, proxies, names, parallel)
+	fmt.Printf("Alive: %d / %d\n\n", len(aliveIndices), len(proxies))
+
+	if len(aliveIndices) == 0 {
+		fmt.Println("No alive proxies")
+		return nil
+	}
+
+	// Build results keeping original names intact
+	var results []NodeInfo
+	for _, idx := range aliveIndices {
+		results = append(results, NodeInfo{
+			OriginalName: names[idx],
+			NewName:      names[idx],
+			Config:       configs[idx],
+		})
+	}
+
+	// Sort by name
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].NewName < results[j].NewName
+	})
+
+	// Write output
+	if err := writeYAML(results, out, false); err != nil {
+		return fmt.Errorf("write output: %w", err)
+	}
+
+	fmt.Printf("Written %d alive proxies to %s\n", len(results), out)
 	return nil
 }
 
