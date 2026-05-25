@@ -1063,6 +1063,7 @@ func expandGeoRuleset(cfg *RawConfig) error {
 			"behavior": "domain",
 			"format":   "mrs",
 			"interval": 86400,
+			"path":     filepath.Join("rules", providerName+".mrs"),
 			"url":      geoRuleSetURL("geosite", name),
 		}
 	}
@@ -1084,6 +1085,7 @@ func expandGeoRuleset(cfg *RawConfig) error {
 			"behavior": "ipcidr",
 			"format":   "mrs",
 			"interval": 86400,
+			"path":     filepath.Join("rules", providerName+".mrs"),
 			"url":      geoRuleSetURL("geoip", name),
 		}
 	}
