@@ -14,6 +14,7 @@ type Selector struct {
 	disableUDP bool
 	selected   string
 	testUrl    string
+	initialIdx int
 }
 
 // DialContext implements C.ProxyAdapter
@@ -80,6 +81,7 @@ func (s *Selector) Set(name string) error {
 	for _, proxy := range s.GetProxies(false) {
 		if proxy.Name() == name {
 			s.selected = name
+			s.initialIdx = 0
 			return nil
 		}
 	}
@@ -89,6 +91,7 @@ func (s *Selector) Set(name string) error {
 
 func (s *Selector) ForceSet(name string) {
 	s.selected = name
+	s.initialIdx = 0
 }
 
 // Unwrap implements C.ProxyAdapter
@@ -98,6 +101,10 @@ func (s *Selector) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 
 func (s *Selector) selectedProxy(touch bool) C.Proxy {
 	proxies := s.GetProxies(touch)
+	if s.initialIdx > 0 && s.initialIdx <= len(proxies) {
+		return proxies[s.initialIdx-1]
+	}
+
 	for _, proxy := range proxies {
 		if proxy.Name() == s.selected {
 			return proxy
@@ -133,5 +140,6 @@ func NewSelector(option *GroupCommonOption, emptyFallback C.Proxy, providers []P
 		selected:   emptyFallback.Name(),
 		disableUDP: option.DisableUDP,
 		testUrl:    option.URL,
+		initialIdx: option.InitialIndex,
 	}
 }
