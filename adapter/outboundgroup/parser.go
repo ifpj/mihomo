@@ -43,6 +43,7 @@ type GroupCommonOption struct {
 	IncludeAllProviders bool     `group:"include-all-providers,omitempty"`
 	Hidden              bool     `group:"hidden,omitempty"`
 	Icon                string   `group:"icon,omitempty"`
+	InitialIndex        int      `group:"initial-index,omitempty"`
 }
 
 func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, providersMap map[string]P.ProxyProvider, AllProxies []string, AllProviders []string) (ProxyGroup, error) {
@@ -57,6 +58,9 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 
 	if groupOption.Type == "" || groupOption.Name == "" {
 		return nil, errFormat
+	}
+	if groupOption.InitialIndex < 0 {
+		return nil, fmt.Errorf("%s: initial-index must be greater than or equal to 0", groupOption.Name)
 	}
 
 	if _, ok := config["routing-mark"]; ok {
