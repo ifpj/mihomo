@@ -44,6 +44,7 @@ type GroupCommonOption struct {
 	Hidden              bool     `group:"hidden,omitempty"`
 	Icon                string   `group:"icon,omitempty"`
 	InitialIndex        int      `group:"initial-index,omitempty"`
+	InitialIndexForce   bool     `group:"initial-index-force,omitempty"`
 }
 
 func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, providersMap map[string]P.ProxyProvider, AllProxies []string, AllProviders []string) (C.ProxyAdapter, error) {
@@ -52,6 +53,7 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 	groupOption := &GroupCommonOption{
 		Lazy: true,
 	}
+	groupOption.InitialIndexForce = true
 	if err := decoder.Decode(config, groupOption); err != nil {
 		return nil, errFormat
 	}
