@@ -515,6 +515,10 @@ func patchSelectGroup(proxies map[string]C.Proxy) {
 	}
 
 	for name, outbound := range proxies {
+		if selector, ok := outbound.Adapter().(*outboundgroup.Selector); ok && selector.InitialIndexForce() {
+			continue
+		}
+
 		selector, ok := outbound.Adapter().(outboundgroup.SelectAble)
 		if !ok {
 			continue
