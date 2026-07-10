@@ -24,8 +24,8 @@ import (
 )
 
 const (
-	baseReleaseURL    = "https://github.com/ifpj/mihomo/releases/download/Prerelease-Meta/"
-	versionReleaseURL = "https://github.com/ifpj/mihomo/releases/download/Prerelease-Meta/version.txt"
+	baseReleaseURL    = "https://github.com/ifpj/mihomo/releases/latest/download/"
+	versionReleaseURL = baseReleaseURL + "version.txt"
 
 	baseAlphaURL    = baseReleaseURL
 	versionAlphaURL = versionReleaseURL
