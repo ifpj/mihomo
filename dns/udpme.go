@@ -6,6 +6,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 	D "github.com/miekg/dns"
@@ -81,7 +82,7 @@ func (c *udpmeClient) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, er
 
 func (c *udpmeClient) ResetConnection() {}
 
-func newUdpmeClient(addr string, resolver *Resolver, params map[string]string, proxyAdapter C.ProxyAdapter, proxyName string) *udpmeClient {
+func newUdpmeClient(addr string, resolver resolver.Resolver, params map[string]string, proxyAdapter C.ProxyAdapter, proxyName string) *udpmeClient {
 	host, port, _ := net.SplitHostPort(addr)
 	return &udpmeClient{
 		port:   port,
