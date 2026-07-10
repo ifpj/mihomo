@@ -122,7 +122,7 @@ func (t *Turn) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_
 		return nil, err
 	}
 
-	return newPacketConn(pc, t), nil
+	return NewPacketConn(pc, t), nil
 }
 
 // turnAllocateUDP performs TURN UDP allocation and returns a net.PacketConn.
